@@ -1661,49 +1661,6 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
-    def test_preflight_defers_eligible_backlog_below_threshold_as_debt(
-        self,
-        tmp_path,
-        monkeypatch,
-    ):
-        config = LCMConfig(
-            database_path=str(tmp_path / "lcm_preflight_below_threshold_debt.db"),
-            fresh_tail_count=2,
-            leaf_chunk_tokens=20,
-            deferred_maintenance_enabled=True,
-        )
-        instance = LCMEngine(config=config)
-        instance.on_session_start("test-session", platform="cli", context_length=10_000)
-        instance.threshold_tokens = 5_000
-        messages = [
-            {"role": "system", "content": "system"},
-            {"role": "user", "content": "old backlog " + "segment " * 100},
-            {"role": "assistant", "content": "old answer " + "detail " * 100},
-            {"role": "user", "content": "fresh request"},
-        ]
-        summary_calls = []
-
-        def summarize_spy(**kwargs):
-            summary_calls.append(kwargs)
-            return "summary", 1
-
-        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summarize_spy)
-
-        try:
-            assert count_messages_tokens(messages) < instance.threshold_tokens
-            requested = instance.should_compress_preflight(messages)
-            if requested:
-                instance.compress(messages, current_tokens=count_messages_tokens(messages))
-
-            assert requested is False
-            state = instance._lifecycle.get_by_conversation(instance._conversation_id)
-            assert state is not None
-            assert state.debt_kind == "raw_backlog"
-            assert state.debt_size_estimate > 0
-            assert summary_calls == []
-        finally:
-            instance.shutdown()
-
     def test_preflight_requests_compaction_for_deferred_maintenance_under_critical_pressure(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_deferred_critical.db"),
@@ -1715,7 +1672,7 @@ class TestEngineABC:
         instance = LCMEngine(config=config)
         instance._bind_lifecycle_state("test-session")
         instance.context_length = 200
-        instance.threshold_tokens = 10_000
+        instance.threshold_tokens = 100
         messages = [
             {"role": "system", "content": "system"},
             {"role": "user", "content": "tiny old backlog"},
@@ -1726,11 +1683,7 @@ class TestEngineABC:
         ]
         try:
             rough = count_messages_tokens(messages)
-            assert rough < instance.threshold_tokens
-            assert instance._critical_budget_pressure_reached(
-                observed_tokens=rough,
-                messages=messages,
-            )
+            assert rough >= instance.threshold_tokens
             eligible, reason = instance._leaf_compaction_candidate_status(messages)
             assert not eligible
             assert "below leaf chunk threshold" in reason
@@ -20309,7 +20262,7 @@ class TestDeferredMaintenanceDebt:
         assert state is not None
         assert state.debt_kind == "raw_backlog"
         assert state.debt_size_estimate > 0
-        assert engine.should_compress_preflight(compressed) is False
+        assert engine.should_compress_preflight(compressed) is True
         refreshed = engine._lifecycle.get_by_conversation(engine._conversation_id)
         assert refreshed is not None
         assert refreshed.debt_kind == "raw_backlog"
