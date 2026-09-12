@@ -9006,6 +9006,54 @@ class TestMessageFiltering:
         assert engine._dag.get_session_node_count(engine._session_id) == 0
         assert summary_calls == []
 
+    def test_ignored_backlog_cleanup_below_threshold_keeps_critical_maintenance(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        engine = self._make_engine(
+            tmp_path,
+            "lcm_msg_ignore_preflight_critical_pressure.db",
+            fresh_tail_count=1,
+            leaf_chunk_tokens=10_000,
+            ignore_message_patterns=["SECRET"],
+            deferred_maintenance_enabled=True,
+            critical_budget_pressure_ratio=0.90,
+        )
+        engine.context_length = 100
+        engine.threshold_tokens = 100_000
+        engine._lifecycle.record_debt(
+            engine._conversation_id,
+            kind="raw_backlog",
+            size_estimate=500,
+        )
+        messages = [
+            {"role": "user", "content": "SECRET ignored backlog " + "x" * 200},
+            {"role": "user", "content": "visible eligible backlog " + "y" * 200},
+            {"role": "user", "content": "fresh request"},
+        ]
+        summary_calls = []
+
+        def summarize_spy(**kwargs):
+            summary_calls.append(kwargs)
+            return "critical maintenance summary", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summarize_spy)
+
+        rough = count_messages_tokens(messages)
+        assert rough < engine.threshold_tokens
+        assert engine._critical_budget_pressure_reached(
+            observed_tokens=rough,
+            messages=messages,
+        )
+        assert engine.should_compress_preflight(messages) is True
+        assert engine._preflight_cleanup_only is False
+        result = engine.compress(messages, current_tokens=rough)
+
+        assert all("SECRET" not in str(msg.get("content", "")) for msg in result)
+        assert engine._dag.get_session_node_count(engine._session_id) == 1
+        assert summary_calls
+
     def test_preflight_uses_replay_view_when_ignored_backlog_masks_tiny_visible_chunk(self, tmp_path):
         engine = self._make_engine(
             tmp_path,

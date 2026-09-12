@@ -488,6 +488,33 @@ def test_live_stub_below_threshold_adoption_skips_eligible_leaf_work(
     summary_spy.assert_not_called()
 
 
+def test_below_threshold_cleanup_handoff_honors_explicit_force(make_engine, monkeypatch):
+    engine = make_engine(fresh_tail_count=2, leaf_chunk_tokens=1)
+    engine.threshold_tokens = 100_000
+    payload = "fresh durable payload with old eligible backlog " * 100
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request with eligible raw backlog"},
+        {"role": "assistant", "content": "old answer with eligible raw backlog"},
+        *tool_pair("forced-eligible-call", payload),
+    ]
+    summary_spy = Mock(
+        return_value=("forced summary\nExpand for details about: old work", 1)
+    )
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(messages) is True
+    assert engine._preflight_cleanup_only is True
+    result = engine.compress(messages, current_tokens=1_000, force=True)
+
+    assert assembled_tool(result, "forced-eligible-call")["content"].startswith(
+        "[Externalized tool output:"
+    )
+    assert engine._dag.get_session_node_count(engine._session_id) == 1
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
 def test_failed_cleanup_only_ingest_does_not_poison_later_threshold_compaction(
     make_engine,
     monkeypatch,
