@@ -1697,6 +1697,88 @@ class TestEngineABC:
         finally:
             instance.shutdown()
 
+    def test_preflight_defers_below_threshold_backlog_to_debt_without_critical_pressure(
+        self,
+        tmp_path,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_below_threshold_debt.db"),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            deferred_maintenance_enabled=True,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("test-session", platform="cli", context_length=1_000_000)
+        instance.threshold_tokens = 850_000
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old backlog " + "segment " * 100},
+            {"role": "assistant", "content": "old answer " + "detail " * 100},
+            {"role": "user", "content": "fresh request"},
+        ]
+        try:
+            rough = count_messages_tokens(messages)
+            assert rough < instance.threshold_tokens
+            eligible, _ = instance._leaf_compaction_candidate_status(messages)
+            assert eligible
+            assert not instance._critical_budget_pressure_reached(
+                observed_tokens=rough,
+                messages=messages,
+            )
+
+            assert instance.should_compress_preflight(messages) is False
+
+            state = instance._lifecycle.get_by_conversation(instance._conversation_id)
+            assert state is not None
+            assert state.debt_kind == "raw_backlog"
+            assert state.debt_size_estimate > 0
+
+            instance.threshold_tokens = rough
+            assert instance.should_compress_preflight(messages) is True
+        finally:
+            instance.shutdown()
+
+    def test_preflight_ignores_persisted_debt_when_deferred_maintenance_disabled(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_preflight_debt_flag_off.db"),
+            fresh_tail_count=2,
+            leaf_chunk_tokens=20,
+            deferred_maintenance_enabled=True,
+            critical_budget_pressure_ratio=0.10,
+        )
+        instance = LCMEngine(config=config)
+        instance.on_session_start("test-session", platform="cli", context_length=1_000)
+        instance.threshold_tokens = 850_000
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old backlog " + "segment " * 100},
+            {"role": "assistant", "content": "old answer " + "detail " * 100},
+            {"role": "user", "content": "fresh request"},
+        ]
+        try:
+            rough = count_messages_tokens(messages)
+            instance._lifecycle.record_debt(
+                instance._conversation_id,
+                kind="raw_backlog",
+                size_estimate=instance._raw_backlog_tokens(messages),
+            )
+            assert instance._has_raw_backlog_debt()
+            assert instance._should_run_deferred_maintenance(messages, observed_tokens=rough)
+
+            # Recorded debt is durable, so disabling the feature must stop
+            # consuming it even when the lifecycle row still reports debt.
+            instance._config.deferred_maintenance_enabled = False
+            monkeypatch.setattr(instance, "_has_raw_backlog_debt", lambda: True)
+
+            assert instance._should_run_deferred_maintenance(messages, observed_tokens=rough) is False
+            assert instance.should_compress_preflight(messages) is False
+        finally:
+            instance.shutdown()
+
     def test_preflight_requests_compaction_when_old_backlog_has_leaf_chunk(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_preflight_leaf_chunk.db"),
@@ -20262,10 +20344,16 @@ class TestDeferredMaintenanceDebt:
         assert state is not None
         assert state.debt_kind == "raw_backlog"
         assert state.debt_size_estimate > 0
-        assert engine.should_compress_preflight(compressed) is True
+        # Below threshold the debt stays parked until critical pressure is
+        # configured and reached, so preflight must not request a pass yet.
+        assert count_messages_tokens(compressed) < engine.threshold_tokens
+        assert engine.should_compress_preflight(compressed) is False
         refreshed = engine._lifecycle.get_by_conversation(engine._conversation_id)
         assert refreshed is not None
         assert refreshed.debt_kind == "raw_backlog"
+
+        engine._config.critical_budget_pressure_ratio = 0.01
+        assert engine.should_compress_preflight(compressed) is True
 
     def test_bounded_catchup_reduces_then_clears_debt_only_after_backlog_shrinks(self, engine, monkeypatch):
         engine._config.dynamic_leaf_chunk_enabled = True
