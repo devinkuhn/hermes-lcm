@@ -573,6 +573,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # One-shot handoff from preflight: publish deterministic replay cleanup
         # without letting below-threshold work invoke the summarizer.
         self._preflight_cleanup_only = False
+        self._sanitation_claim_lock = threading.RLock()
+        self._pending_sanitation_claim = None
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
@@ -773,6 +775,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
     def _reset_profile_runtime_state(self) -> None:
         """Clear process-local session state that cannot cross profile homes."""
+        self._invalidate_sanitation_operation()
         if self._adaptive_retrieval is not None:
             self._adaptive_retrieval.clear()
         self._unregister_active_engine_binding()
@@ -2619,6 +2622,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
+        self._invalidate_sanitation_operation()
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
@@ -3570,6 +3574,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             raise
 
     def on_session_reset(self) -> None:
+        self._invalidate_sanitation_operation()
         if self._host_fallback_compressor is not None:
             compressor = self._host_fallback_compressor
             on_session_reset = getattr(compressor, "on_session_reset", None)

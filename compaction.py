@@ -31,6 +31,12 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    def _invalidate_sanitation_operation(self) -> None:
+        with self._sanitation_claim_lock:
+            self._pending_sanitation_claim = None
+            self._preflight_cleanup_only = False
+            self._preflight_cleanup_handoff = None
+
     def _cleanup_handoff_message_identity(
         self,
         messages: List[Dict[str, Any]],
@@ -45,6 +51,41 @@ class CompactionMixin:
         )
         if callable(maybe_reclassify):
             maybe_reclassify()
+
+    def prepare_compression_operation(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        session_id: str | None = None,
+        attempt_generation: int | None = None,
+    ) -> tuple[str, object] | None:
+        """Claim one preflight-proven pure-sanitation invocation."""
+        with self._sanitation_claim_lock:
+            handoff = getattr(self, "_preflight_cleanup_handoff", None)
+            self._pending_sanitation_claim = None
+            self._preflight_cleanup_only = False
+            self._preflight_cleanup_handoff = None
+            if (
+                handoff is None
+                or handoff[0] != self._session_id
+                or handoff[1] != self._conversation_id
+                or handoff[2] != self._cleanup_handoff_message_identity(messages)
+                or not session_id
+                or session_id != self._session_id
+                or isinstance(attempt_generation, bool)
+                or not isinstance(attempt_generation, int)
+                or attempt_generation
+                != getattr(self, "_compression_attempt_generation", None)
+            ):
+                return None
+            claim = object()
+            self._pending_sanitation_claim = (
+                claim,
+                handoff,
+                session_id,
+                attempt_generation,
+            )
+            return "sanitize", claim
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._bypasses_lcm_context_management():
@@ -74,8 +115,7 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
-        self._preflight_cleanup_only = False
-        self._preflight_cleanup_handoff = None
+        self._invalidate_sanitation_operation()
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
@@ -182,6 +222,7 @@ class CompactionMixin:
                     self._preflight_cleanup_only = True
                     self._preflight_cleanup_handoff = (
                         self._session_id,
+                        self._conversation_id,
                         self._cleanup_handoff_message_identity(messages),
                         self._cleanup_handoff_message_identity(replay_messages),
                     )
@@ -531,15 +572,41 @@ class CompactionMixin:
     def compress(self, messages: List[Dict[str, Any]],
                  current_tokens: int = None,
                  focus_topic: Optional[str] = None,
-                 force: bool = False) -> List[Dict[str, Any]]:
+                 force: bool = False,
+                 operation_claim: object = None) -> (
+                     List[Dict[str, Any]]
+                     | tuple[List[Dict[str, Any]], object]
+                 ):
         """Run compaction and leave a terminal public status on every failure."""
+        with self._sanitation_claim_lock:
+            pending_claim = self._pending_sanitation_claim
+            self._pending_sanitation_claim = None
+        claimed_sanitation = bool(
+            pending_claim is not None
+            and operation_claim is pending_claim[0]
+            and pending_claim[1][0] == self._session_id
+            and pending_claim[1][1] == self._conversation_id
+            and pending_claim[1][2]
+            == self._cleanup_handoff_message_identity(messages)
+            and pending_claim[2] == self._session_id
+            and pending_claim[3]
+            == getattr(self, "_compression_attempt_generation", None)
+            and not force
+        )
         try:
-            return self._compress_impl(
+            result = self._compress_impl(
                 messages,
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
+                claimed_sanitation=claimed_sanitation,
+                claimed_sanitation_handoff=(
+                    pending_claim[1] if claimed_sanitation else None
+                ),
             )
+            if claimed_sanitation and self._last_compression_status == "sanitized":
+                return result, operation_claim
+            return result
         except BaseException:
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""
@@ -548,7 +615,9 @@ class CompactionMixin:
     def _compress_impl(self, messages: List[Dict[str, Any]],
                        current_tokens: int = None,
                        focus_topic: Optional[str] = None,
-                       force: bool = False) -> List[Dict[str, Any]]:
+                       force: bool = False,
+                       claimed_sanitation: bool = False,
+                       claimed_sanitation_handoff=None) -> List[Dict[str, Any]]:
         """Main compaction entry point.
 
         1. Ingest any new messages into the store
@@ -611,12 +680,12 @@ class CompactionMixin:
         # Step 1: Ingest new messages into the immutable store. Work from a
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
-        cleanup_handoff = getattr(self, "_preflight_cleanup_handoff", None)
+        cleanup_handoff = claimed_sanitation_handoff
         cleanup_handoff_matches_request = bool(
-            self._preflight_cleanup_only
+            claimed_sanitation
             and cleanup_handoff
             and cleanup_handoff[0] == self._session_id
-            and cleanup_handoff[1]
+            and cleanup_handoff[2]
             == self._cleanup_handoff_message_identity(messages)
             and not force_overflow
             and not force
@@ -627,7 +696,7 @@ class CompactionMixin:
         ingest_cleanup_changed_active_context = working_messages != messages
         preflight_cleanup_only = bool(
             cleanup_handoff_matches_request
-            and cleanup_handoff[2]
+            and cleanup_handoff[3]
             == self._cleanup_handoff_message_identity(working_messages)
         )
         if preflight_cleanup_only:

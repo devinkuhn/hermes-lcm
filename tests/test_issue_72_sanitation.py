@@ -48,6 +48,329 @@ def _content_text(messages) -> str:
     return json.dumps(messages, ensure_ascii=False, sort_keys=True)
 
 
+def _claim_sanitation(engine, messages, *, generation: int = 1):
+    engine._compression_attempt_generation = generation
+    prepared = engine.prepare_compression_operation(
+        deepcopy(messages),
+        session_id=engine.bound_session_id,
+        attempt_generation=generation,
+    )
+    assert prepared is not None
+    operation, claim = prepared
+    assert operation == "sanitize"
+    assert claim is not None
+    return claim
+
+
+def test_claimed_sanitation_returns_exact_opaque_claim_once(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, "claimed-happy")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-claimed-happy-000000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    monkeypatch.setattr(
+        lcm_engine,
+        "summarize_with_escalation",
+        Mock(side_effect=AssertionError("sanitation must not summarize")),
+    )
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=17)
+
+    sanitized, returned_claim = engine.compress(
+        deepcopy(messages),
+        current_tokens=count_messages_tokens(messages),
+        operation_claim=claim,
+    )
+
+    assert returned_claim is claim
+    assert engine.last_compression_status == "sanitized"
+    assert "sk-synthetic-claimed-happy" not in _content_text(sanitized)
+    assert engine.should_compress_preflight(deepcopy(sanitized)) is False
+    assert (
+        engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id=engine.bound_session_id,
+            attempt_generation=17,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("session_id", "attempt_generation"),
+    [
+        ("different-host-session", 7),
+        (None, 7),
+        ("bound", 6),
+        ("bound", None),
+        ("bound", True),
+    ],
+)
+def test_prepare_rejects_wrong_host_session_or_attempt(
+    tmp_path,
+    session_id,
+    attempt_generation,
+):
+    engine = _engine(tmp_path, f"invalid-host-binding-{session_id}-{attempt_generation}")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-invalid-host-binding-000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    engine._compression_attempt_generation = 7
+    if session_id == "bound":
+        session_id = engine.bound_session_id
+
+    assert (
+        engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id=session_id,
+            attempt_generation=attempt_generation,
+        )
+        is None
+    )
+
+
+def test_second_prepare_consumes_handoff_and_invalidates_first_claim(tmp_path):
+    engine = _engine(tmp_path, "claim-second-prepare")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-second-prepare-000000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=8)
+
+    assert (
+        engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id=engine.bound_session_id,
+            attempt_generation=8,
+        )
+        is None
+    )
+    assert isinstance(
+        engine.compress(deepcopy(messages), operation_claim=claim),
+        list,
+    )
+
+
+def test_equal_but_nonidentical_claim_is_rejected_and_consumes_real_claim(tmp_path):
+    class EqualClaim:
+        def __eq__(self, _other):
+            return True
+
+    engine = _engine(tmp_path, "claim-identity")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-claim-identity-0000000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=9)
+
+    assert isinstance(
+        engine.compress(deepcopy(messages), operation_claim=EqualClaim()),
+        list,
+    )
+    assert isinstance(
+        engine.compress(deepcopy(messages), operation_claim=claim),
+        list,
+    )
+
+
+def test_attempt_generation_advance_invalidates_claim(tmp_path):
+    engine = _engine(tmp_path, "claim-attempt-advance")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-attempt-advance-00000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=10)
+    engine._compression_attempt_generation = 11
+
+    assert isinstance(
+        engine.compress(deepcopy(messages), operation_claim=claim),
+        list,
+    )
+
+
+def test_intervening_preflight_invalidates_claim(tmp_path):
+    engine = _engine(tmp_path, "claim-intervening-preflight")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-intervening-preflight-0000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages)
+
+    assert engine.should_compress_preflight(
+        [{"role": "user", "content": "intervening benign input"}]
+    ) is False
+    result = engine.compress(deepcopy(messages), operation_claim=claim)
+
+    assert isinstance(result, list)
+
+
+def test_session_change_and_rebind_invalidates_claim(tmp_path):
+    engine = _engine(tmp_path, "claim-session-rebind")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-session-rebind-000000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=2)
+
+    engine.on_session_start(
+        "temporary-session",
+        platform="synthetic",
+        conversation_id="temporary-conversation",
+        context_length=100_000,
+    )
+    engine.on_session_start(
+        "claim-session-rebind-session",
+        platform="synthetic",
+        conversation_id="claim-session-rebind-conversation",
+        context_length=100_000,
+    )
+    result = engine.compress(deepcopy(messages), operation_claim=claim)
+
+    assert isinstance(result, list)
+
+
+def test_session_reset_invalidates_claim(tmp_path):
+    engine = _engine(
+        tmp_path,
+        "claim-session-reset",
+        new_session_retain_depth=-1,
+    )
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-session-reset-0000000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=3)
+
+    engine.on_session_reset()
+    result = engine.compress(deepcopy(messages), operation_claim=claim)
+
+    assert isinstance(result, list)
+
+
+def test_storage_rebind_invalidates_claim(tmp_path):
+    engine = _engine(tmp_path, "claim-storage-rebind")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-storage-rebind-000000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=4)
+
+    assert engine._rebind_storage_for_home(str(tmp_path / "different-home")) is True
+    assert isinstance(
+        engine.compress(deepcopy(messages), operation_claim=claim),
+        list,
+    )
+
+
+def test_claim_is_consumed_when_compression_raises(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, "claim-exception")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-claim-exception-0000000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=5)
+    monkeypatch.setattr(
+        engine,
+        "_ingest_messages",
+        Mock(side_effect=RuntimeError("synthetic claimed failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic claimed failure"):
+        engine.compress(deepcopy(messages), operation_claim=claim)
+    assert engine._pending_sanitation_claim is None
+
+
+@pytest.mark.parametrize("mode", ["force", "overflow"])
+def test_force_and_overflow_never_echo_sanitation_claim(
+    tmp_path,
+    monkeypatch,
+    mode,
+):
+    engine = _engine(tmp_path, f"claim-{mode}", fresh_tail_count=1)
+    messages = [
+        {"role": "user", "content": "eligible backlog " * 20},
+        {
+            "role": "assistant",
+            "content": f"api_key=sk-synthetic-claim-{mode}-00000000000000",
+        },
+        {"role": "user", "content": "fresh"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=6)
+    if mode == "overflow":
+        monkeypatch.setattr(
+            engine,
+            "_should_force_overflow_recovery",
+            lambda **_kwargs: True,
+        )
+    monkeypatch.setattr(
+        lcm_engine,
+        "summarize_with_escalation",
+        Mock(return_value=("summary", 1)),
+    )
+
+    result = engine.compress(
+        deepcopy(messages),
+        current_tokens=count_messages_tokens(messages),
+        force=mode == "force",
+        operation_claim=claim,
+    )
+
+    assert isinstance(result, list)
+
+
+def test_generic_compression_never_echoes_unrecognized_claim(tmp_path):
+    engine = _engine(
+        tmp_path,
+        "generic-no-claim-echo",
+        sensitive_patterns_enabled=False,
+    )
+    messages = [{"role": "user", "content": "ordinary below-threshold input"}]
+
+    result = engine.compress(messages, operation_claim=object())
+
+    assert isinstance(result, list)
+
+
 def test_below_floor_replay_cleanup_is_pure_sanitation(tmp_path, monkeypatch):
     engine = _engine(tmp_path, "below-floor")
     engine.threshold_tokens = 90_000
@@ -66,8 +389,14 @@ def test_below_floor_replay_cleanup_is_pure_sanitation(tmp_path, monkeypatch):
 
     assert count_messages_tokens(messages) < engine.threshold_tokens
     assert engine.should_compress_preflight(deepcopy(messages)) is True
-    sanitized = engine.compress(deepcopy(messages), current_tokens=count_messages_tokens(messages))
+    claim = _claim_sanitation(engine, messages, generation=12)
+    sanitized, returned_claim = engine.compress(
+        deepcopy(messages),
+        current_tokens=count_messages_tokens(messages),
+        operation_claim=claim,
+    )
 
+    assert returned_claim is claim
     assert engine.last_compression_status == "sanitized"
     assert engine._dag.get_session_node_count(engine.current_session_id) == 0
     assert "sk-synthetic-subthreshold" not in _content_text(sanitized)
@@ -118,7 +447,8 @@ def test_no_leaf_scaffold_reassembly_has_distinct_status(tmp_path, monkeypatch):
         {"role": "assistant", "content": "fresh answer"},
     ]
 
-    assert engine.compress(messages) == messages
+    claim = object()
+    assert engine.compress(messages, operation_claim=claim) == messages
     assert engine.last_compression_status == "reassembled"
 
 
@@ -366,11 +696,14 @@ def test_cleanup_handoff_cannot_sanitize_an_interleaved_message_set(
 
     assert engine.should_compress_preflight(deepcopy(cleanup_messages)) is True
     assert engine._preflight_cleanup_only is True
-    engine.compress(
+    claim = _claim_sanitation(engine, cleanup_messages, generation=20)
+    result = engine.compress(
         deepcopy(unrelated_messages),
         current_tokens=count_messages_tokens(unrelated_messages),
+        operation_claim=claim,
     )
 
+    assert isinstance(result, list)
     assert engine.last_compression_status == "compacted"
     summary_spy.assert_called()
 
@@ -398,17 +731,20 @@ def test_cleanup_handoff_cannot_cross_session_boundaries(
 
     assert engine.should_compress_preflight(deepcopy(cleanup_messages)) is True
     assert engine._preflight_cleanup_only is True
+    claim = _claim_sanitation(engine, cleanup_messages, generation=21)
     engine.on_session_start(
         "handoff-cross-session-second-session",
         platform="synthetic",
         conversation_id="handoff-cross-session-second-conversation",
         context_length=100_000,
     )
-    engine.compress(
+    result = engine.compress(
         deepcopy(next_session_messages),
         current_tokens=count_messages_tokens(next_session_messages),
+        operation_claim=claim,
     )
 
+    assert isinstance(result, list)
     assert engine.last_compression_status == "compacted"
     summary_spy.assert_called()
 
@@ -443,9 +779,15 @@ def test_cleanup_handoff_cannot_sanitize_an_interleaved_threshold_call(
     engine.threshold_tokens = 90_000
     assert engine.should_compress_preflight(deepcopy(cleanup_messages)) is True
     assert engine._preflight_cleanup_only is True
+    claim = _claim_sanitation(engine, cleanup_messages, generation=22)
     engine.threshold_tokens = threshold_tokens
-    engine.compress(deepcopy(threshold_messages), current_tokens=threshold_tokens)
+    result = engine.compress(
+        deepcopy(threshold_messages),
+        current_tokens=threshold_tokens,
+        operation_claim=claim,
+    )
 
+    assert isinstance(result, list)
     assert engine.last_compression_status == "compacted"
     summary_spy.assert_called()
 
@@ -536,10 +878,13 @@ def test_full_sanitation_round_trip_converges_without_leakage(
     with caplog.at_level(logging.INFO):
         assert engine.should_compress_preflight(deepcopy(messages)) is True
         assert engine._preflight_cleanup_only is True
-        adopted = engine.compress(
+        claim = _claim_sanitation(engine, messages, generation=13)
+        adopted, returned_claim = engine.compress(
             deepcopy(messages),
             current_tokens=count_messages_tokens(messages),
+            operation_claim=claim,
         )
+    assert returned_claim is claim
     assert engine.last_compression_status == "sanitized"
     assert engine._dag.get_session_node_count(engine.current_session_id) == 0
     adopted_tool_result = next(
