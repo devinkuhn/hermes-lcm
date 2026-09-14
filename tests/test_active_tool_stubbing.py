@@ -366,7 +366,9 @@ def test_live_stub_adoption_outranks_compression_boundary_cooldown(make_engine):
     assert engine.last_compression_status == "sanitized"
 
 
-def test_flag_off_plain_preflight_cooldown_blocks_threshold_and_overflow(make_engine):
+def test_flag_off_plain_preflight_cooldown_blocks_threshold_but_preserves_overflow(
+    make_engine,
+):
     engine = make_engine(
         large_output_active_replay_stubbing_enabled=False,
         max_assembly_tokens=10,
@@ -376,7 +378,7 @@ def test_flag_off_plain_preflight_cooldown_blocks_threshold_and_overflow(make_en
     messages = [{"role": "user", "content": "plain branch pressure " * 100}]
 
     assert engine._should_force_overflow_recovery(messages=messages) is True
-    assert engine.should_compress_preflight(messages) is False
+    assert engine.should_compress_preflight(messages) is True
 
 
 def test_flag_off_replay_cleanup_preflight_outranks_boundary_cooldown(

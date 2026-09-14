@@ -220,6 +220,93 @@ def test_replay_cleanup_does_not_swallow_critical_leaf_compaction(
     summary_spy.assert_called()
 
 
+def test_cooldown_preserves_unchanged_replay_critical_leaf_work(tmp_path):
+    engine = _engine(
+        tmp_path,
+        "cooldown-critical-leaf",
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+        critical_budget_pressure_ratio=0.8,
+        sensitive_patterns_enabled=False,
+    )
+    engine.context_length = 100
+    engine.threshold_tokens = 90_000
+    engine._last_boundary_skip_time = time.time()
+    messages = [
+        {"role": "user", "content": "critical eligible backlog " * 30},
+        {"role": "assistant", "content": "critical eligible answer"},
+        {"role": "user", "content": "fresh question"},
+    ]
+    rough = count_messages_tokens(messages)
+
+    assert engine._critical_budget_pressure_reached(
+        observed_tokens=rough,
+        messages=messages,
+    )
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+
+def test_cooldown_preserves_unchanged_replay_critical_ignored_backlog(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(
+        tmp_path,
+        "cooldown-critical-ignored",
+        critical_budget_pressure_ratio=0.8,
+        sensitive_patterns_enabled=False,
+    )
+    engine.context_length = 10
+    engine.threshold_tokens = 90_000
+    engine._last_boundary_skip_time = time.time()
+    messages = [{"role": "user", "content": "critical ignored backlog"}]
+    monkeypatch.setattr(
+        engine,
+        "_leaf_compaction_candidate_status",
+        lambda *_args, **_kwargs: (False, "no eligible leaf"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_has_ignored_backlog_outside_fresh_tail",
+        lambda _messages: True,
+    )
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+
+def test_cooldown_preserves_unchanged_replay_critical_deferred_maintenance(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(
+        tmp_path,
+        "cooldown-critical-deferred",
+        critical_budget_pressure_ratio=0.8,
+        sensitive_patterns_enabled=False,
+    )
+    engine.context_length = 10
+    engine.threshold_tokens = 90_000
+    engine._last_boundary_skip_time = time.time()
+    messages = [{"role": "user", "content": "critical deferred backlog"}]
+    monkeypatch.setattr(
+        engine,
+        "_leaf_compaction_candidate_status",
+        lambda *_args, **_kwargs: (False, "no eligible leaf"),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_has_ignored_backlog_outside_fresh_tail",
+        lambda _messages: False,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_should_run_deferred_maintenance",
+        lambda *_args, **_kwargs: True,
+    )
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+
 def test_cleanup_state_is_cleared_before_fallible_ingest_and_cannot_hijack_force(
     tmp_path,
     monkeypatch,
@@ -251,6 +338,113 @@ def test_cleanup_state_is_cleared_before_fallible_ingest_and_cannot_hijack_force
     monkeypatch.setattr(engine, "_ingest_messages", real_ingest)
     monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
     engine.compress(deepcopy(messages), current_tokens=100, force=True)
+
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
+def test_cleanup_handoff_cannot_sanitize_an_interleaved_message_set(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "handoff-cross-message")
+    engine.threshold_tokens = 90_000
+    cleanup_messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-cross-message-0000000000000000",
+        },
+        {"role": "assistant", "content": "fresh cleanup answer"},
+    ]
+    unrelated_messages = [
+        {"role": "user", "content": "unrelated eligible backlog"},
+        {"role": "assistant", "content": "unrelated eligible answer"},
+        {"role": "user", "content": "unrelated fresh question"},
+    ]
+    summary_spy = Mock(return_value=("unrelated summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(deepcopy(cleanup_messages)) is True
+    assert engine._preflight_cleanup_only is True
+    engine.compress(
+        deepcopy(unrelated_messages),
+        current_tokens=count_messages_tokens(unrelated_messages),
+    )
+
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
+def test_cleanup_handoff_cannot_cross_session_boundaries(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "handoff-cross-session")
+    engine.threshold_tokens = 90_000
+    cleanup_messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-cross-session-0000000000000000",
+        },
+        {"role": "assistant", "content": "fresh cleanup answer"},
+    ]
+    next_session_messages = [
+        {"role": "user", "content": "next-session eligible backlog"},
+        {"role": "assistant", "content": "next-session eligible answer"},
+        {"role": "user", "content": "next-session fresh question"},
+    ]
+    summary_spy = Mock(return_value=("next-session summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(deepcopy(cleanup_messages)) is True
+    assert engine._preflight_cleanup_only is True
+    engine.on_session_start(
+        "handoff-cross-session-second-session",
+        platform="synthetic",
+        conversation_id="handoff-cross-session-second-conversation",
+        context_length=100_000,
+    )
+    engine.compress(
+        deepcopy(next_session_messages),
+        current_tokens=count_messages_tokens(next_session_messages),
+    )
+
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
+def test_cleanup_handoff_cannot_sanitize_an_interleaved_threshold_call(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(
+        tmp_path,
+        "handoff-threshold",
+        threshold_full_sweep_enabled=False,
+    )
+    engine.threshold_tokens = 90_000
+    cleanup_messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-threshold-handoff-000000000000",
+        },
+        {"role": "assistant", "content": "fresh cleanup answer"},
+    ]
+    threshold_messages = [
+        {"role": "user", "content": "threshold eligible backlog"},
+        {"role": "assistant", "content": "threshold eligible answer"},
+        {"role": "user", "content": "threshold fresh question"},
+    ]
+    threshold_tokens = count_messages_tokens(threshold_messages)
+    engine.threshold_tokens = threshold_tokens
+    summary_spy = Mock(return_value=("threshold summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    engine.threshold_tokens = 90_000
+    assert engine.should_compress_preflight(deepcopy(cleanup_messages)) is True
+    assert engine._preflight_cleanup_only is True
+    engine.threshold_tokens = threshold_tokens
+    engine.compress(deepcopy(threshold_messages), current_tokens=threshold_tokens)
 
     assert engine.last_compression_status == "compacted"
     summary_spy.assert_called()
@@ -368,7 +562,19 @@ def test_full_sanitation_round_trip_converges_without_leakage(
         large_output_externalization_threshold_chars=120,
     )
     restarted.threshold_tokens = 90_000
-    second_replay = restarted._ingest_messages(deepcopy(adopted))
+    assert restarted.should_compress_preflight(deepcopy(adopted)) is False
+    restarted.shutdown()
+
+    replay_probe = _engine(
+        tmp_path,
+        name,
+        fresh_tail_count=2,
+        leaf_chunk_tokens=20_000,
+        large_output_externalization_enabled=True,
+        large_output_externalization_threshold_chars=120,
+    )
+    replay_probe.threshold_tokens = 90_000
+    second_replay = replay_probe._ingest_messages(deepcopy(adopted))
 
     adopted_bytes = json.dumps(
         adopted,
@@ -381,18 +587,17 @@ def test_full_sanitation_round_trip_converges_without_leakage(
         separators=(",", ":"),
     ).encode()
     assert second_replay_bytes == adopted_bytes
-    assert restarted.should_compress_preflight(deepcopy(adopted)) is False
     third_replay_bytes = json.dumps(
-        restarted._ingest_messages(deepcopy(adopted)),
+        replay_probe._ingest_messages(deepcopy(adopted)),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()
     assert third_replay_bytes == adopted_bytes
-    assert restarted._dag.get_session_node_count(restarted.current_session_id) == 0
+    assert replay_probe._dag.get_session_node_count(replay_probe.current_session_id) == 0
 
     stored = "\n".join(
         "\n".join((str(row[0] or ""), str(row[1] or "")))
-        for row in restarted._store._conn.execute(
+        for row in replay_probe._store._conn.execute(
             "SELECT content, tool_calls FROM messages"
         ).fetchall()
     )
@@ -405,9 +610,9 @@ def test_full_sanitation_round_trip_converges_without_leakage(
         assert raw not in stored
         assert raw not in externalized
         assert raw not in observed_logs
-        assert restarted._store.search(
+        assert replay_probe._store.search(
             raw,
-            session_id=restarted.current_session_id,
+            session_id=replay_probe.current_session_id,
         ) == []
 
 

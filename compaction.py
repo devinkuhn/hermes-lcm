@@ -31,6 +31,12 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    def _cleanup_handoff_message_identity(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[tuple[str, str, str, str], ...]:
+        return tuple(self._message_replay_identity(message) for message in messages)
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -69,17 +75,18 @@ class CompactionMixin:
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
         self._preflight_cleanup_only = False
+        self._preflight_cleanup_handoff = None
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             rough = count_messages_tokens(messages)
-            if self._compression_boundary_cooldown_active():
-                return False
             if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
                 return self._mark_preflight_compression_requested(
                     operation="compact",
                     reason="overflow_recovery",
                 )
+            if self._compression_boundary_cooldown_active():
+                return False
             if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
                 return self._mark_preflight_compression_requested(
                     operation="compact",
@@ -173,6 +180,11 @@ class CompactionMixin:
                     )
                 ):
                     self._preflight_cleanup_only = True
+                    self._preflight_cleanup_handoff = (
+                        self._session_id,
+                        self._cleanup_handoff_message_identity(messages),
+                        self._cleanup_handoff_message_identity(replay_messages),
+                    )
                 cleanup_trigger = ""
                 if force_overflow_requested:
                     cleanup_trigger = "overflow_recovery"
@@ -193,14 +205,8 @@ class CompactionMixin:
                     operation="compact",
                     reason="overflow_recovery",
                 )
-            # A boundary skip cools down summary-producing leaf/condensation
-            # work. It must not prevent the host from adopting a replay cleanup
-            # that ingest has already made durable (for example a live tool
-            # result stub); those returns above are deterministic and add no
-            # summarizer spend.
-            if self._compression_boundary_cooldown_active():
-                return False
-            if pre_ingest_placeholder_ambiguous_noop:
+            cooldown_active = self._compression_boundary_cooldown_active()
+            if pre_ingest_placeholder_ambiguous_noop and not cooldown_active:
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
@@ -214,7 +220,11 @@ class CompactionMixin:
                 ),
             )
             if eligible:
-                if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
+                if (
+                    not cooldown_active
+                    and self.threshold_tokens > 0
+                    and replay_rough >= self.threshold_tokens
+                ):
                     return self._mark_preflight_compression_requested(
                         operation="compact",
                         reason="eligible_leaf",
@@ -235,7 +245,11 @@ class CompactionMixin:
                     )
                 return False
             if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
-                if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
+                if (
+                    not cooldown_active
+                    and self.threshold_tokens > 0
+                    and replay_rough >= self.threshold_tokens
+                ):
                     return self._mark_preflight_compression_requested(
                         operation="compact",
                         reason="ignored_backlog",
@@ -255,7 +269,11 @@ class CompactionMixin:
                         trigger="critical_pressure",
                     )
                 return False
-            if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
+            if (
+                not cooldown_active
+                and self.threshold_tokens > 0
+                and replay_rough >= self.threshold_tokens
+            ):
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
                     return self._mark_preflight_compression_requested(
                         operation="compact",
@@ -280,14 +298,17 @@ class CompactionMixin:
                     trigger="critical_pressure",
                 )
             return False
-        if self._compression_boundary_cooldown_active():
-            return False
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return self._mark_preflight_compression_requested(
                 operation="compact",
                 reason="overflow_recovery",
             )
-        if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
+        cooldown_active = self._compression_boundary_cooldown_active()
+        if (
+            not cooldown_active
+            and self.threshold_tokens > 0
+            and rough >= self.threshold_tokens
+        ):
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = pre_ingest_noop_reason
@@ -590,12 +611,25 @@ class CompactionMixin:
         # Step 1: Ingest new messages into the immutable store. Work from a
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
-        preflight_cleanup_only = bool(
-            self._preflight_cleanup_only and not force_overflow and not force
+        cleanup_handoff = getattr(self, "_preflight_cleanup_handoff", None)
+        cleanup_handoff_matches_request = bool(
+            self._preflight_cleanup_only
+            and cleanup_handoff
+            and cleanup_handoff[0] == self._session_id
+            and cleanup_handoff[1]
+            == self._cleanup_handoff_message_identity(messages)
+            and not force_overflow
+            and not force
         )
         self._preflight_cleanup_only = False
+        self._preflight_cleanup_handoff = None
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        preflight_cleanup_only = bool(
+            cleanup_handoff_matches_request
+            and cleanup_handoff[2]
+            == self._cleanup_handoff_message_identity(working_messages)
+        )
         if preflight_cleanup_only:
             sanitized_messages = self._sanitize_active_context_messages(
                 working_messages,
