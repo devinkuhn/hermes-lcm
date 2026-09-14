@@ -1013,10 +1013,29 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         """Whether the most recent compression/preflight decision was a no-op."""
         return self._last_compression_status == "noop"
 
-    def _mark_preflight_compression_requested(self) -> bool:
-        """Record that preflight found work and clear any stale no-op reason."""
+    def _mark_preflight_compression_requested(
+        self,
+        *,
+        operation: str,
+        reason: str,
+        trigger: str = "",
+    ) -> bool:
+        """Record and explain a positive preflight decision without content."""
         self._last_compression_status = "pending"
         self._last_compression_noop_reason = ""
+        if trigger:
+            logger.info(
+                "LCM preflight decision operation=%s reason=%s trigger=%s",
+                operation,
+                reason,
+                trigger,
+            )
+        else:
+            logger.info(
+                "LCM preflight decision operation=%s reason=%s",
+                operation,
+                reason,
+            )
         return True
 
     @property

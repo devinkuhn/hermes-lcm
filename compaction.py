@@ -76,8 +76,16 @@ class CompactionMixin:
             if self._compression_boundary_cooldown_active():
                 return False
             if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
-                return True
-            return self.threshold_tokens > 0 and rough >= self.threshold_tokens
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="overflow_recovery",
+                )
+            if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="threshold",
+                )
+            return False
         rough = count_messages_tokens(messages)
         pre_ingest_placeholder_ambiguous_noop = False
         pre_ingest_noop_reason = ""
@@ -113,11 +121,14 @@ class CompactionMixin:
                 # via deterministic L3 truncation without needing the store write.
                 self._record_ingest_failure("preflight", e)
                 if self._should_force_overflow_recovery(observed_tokens=rough):
-                    return True
+                    return self._mark_preflight_compression_requested(
+                        operation="compact",
+                        reason="overflow_recovery",
+                    )
                 return False
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
-            cleanup_requested = self._replay_diff_requests_ingest_cleanup(
+            cleanup_reason = self._replay_diff_ingest_cleanup_reason(
                 messages,
                 replay_messages,
             )
@@ -128,21 +139,33 @@ class CompactionMixin:
                 observed_tokens=replay_rough,
                 messages=replay_messages,
             )
-            if cleanup_requested:
+            if cleanup_reason:
                 # Deterministic replay cleanup, including ignored-message
                 # sanitization, may publish below threshold but must not
                 # piggyback summary work. Configured critical pressure still
-                # owes a maintenance pass, so cleanup must not swallow it.
-                critical_maintenance_due = self._critical_budget_pressure_reached(
+                # permits declared compaction work, so cleanup must not swallow it.
+                critical_pressure = self._critical_budget_pressure_reached(
                     observed_tokens=replay_rough,
                     messages=replay_messages,
-                ) and self._should_run_deferred_maintenance(
-                    replay_messages,
-                    observed_tokens=replay_rough,
                 )
+                critical_compaction_due = False
+                if critical_pressure:
+                    critical_leaf_eligible, _critical_leaf_reason = (
+                        self._leaf_compaction_candidate_status(replay_messages)
+                    )
+                    critical_compaction_due = (
+                        critical_leaf_eligible
+                        or self._has_ignored_backlog_outside_fresh_tail(
+                            replay_messages
+                        )
+                        or self._should_run_deferred_maintenance(
+                            replay_messages,
+                            observed_tokens=replay_rough,
+                        )
+                    )
                 if (
                     not force_overflow_requested
-                    and not critical_maintenance_due
+                    and not critical_compaction_due
                     and (
                         self._compression_boundary_cooldown_active()
                         or self.threshold_tokens <= 0
@@ -150,9 +173,26 @@ class CompactionMixin:
                     )
                 ):
                     self._preflight_cleanup_only = True
-                return self._mark_preflight_compression_requested()
+                cleanup_trigger = ""
+                if force_overflow_requested:
+                    cleanup_trigger = "overflow_recovery"
+                elif critical_compaction_due:
+                    cleanup_trigger = "critical_pressure"
+                elif (
+                    self.threshold_tokens > 0
+                    and max(rough, replay_rough) >= self.threshold_tokens
+                ):
+                    cleanup_trigger = "threshold"
+                return self._mark_preflight_compression_requested(
+                    operation="sanitize" if self._preflight_cleanup_only else "compact",
+                    reason=cleanup_reason,
+                    trigger=cleanup_trigger,
+                )
             if force_overflow_requested:
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="overflow_recovery",
+                )
             # A boundary skip cools down summary-producing leaf/condensation
             # work. It must not prevent the host from adopting a replay cleanup
             # that ingest has already made durable (for example a live tool
@@ -175,7 +215,11 @@ class CompactionMixin:
             )
             if eligible:
                 if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
-                    return self._mark_preflight_compression_requested()
+                    return self._mark_preflight_compression_requested(
+                        operation="compact",
+                        reason="eligible_leaf",
+                        trigger="threshold",
+                    )
                 self._refresh_raw_backlog_debt(
                     replay_messages,
                     observed_tokens=replay_rough,
@@ -184,13 +228,40 @@ class CompactionMixin:
                     observed_tokens=replay_rough,
                     messages=replay_messages,
                 ):
-                    return self._mark_preflight_compression_requested()
+                    return self._mark_preflight_compression_requested(
+                        operation="compact",
+                        reason="eligible_leaf",
+                        trigger="critical_pressure",
+                    )
                 return False
             if self._has_ignored_backlog_outside_fresh_tail(replay_messages):
-                return self._mark_preflight_compression_requested()
+                if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
+                    return self._mark_preflight_compression_requested(
+                        operation="compact",
+                        reason="ignored_backlog",
+                        trigger="threshold",
+                    )
+                self._refresh_raw_backlog_debt(
+                    replay_messages,
+                    observed_tokens=replay_rough,
+                )
+                if self._critical_budget_pressure_reached(
+                    observed_tokens=replay_rough,
+                    messages=replay_messages,
+                ):
+                    return self._mark_preflight_compression_requested(
+                        operation="compact",
+                        reason="ignored_backlog",
+                        trigger="critical_pressure",
+                    )
+                return False
             if self.threshold_tokens > 0 and replay_rough >= self.threshold_tokens:
                 if self._should_run_deferred_maintenance(replay_messages, observed_tokens=replay_rough):
-                    return self._mark_preflight_compression_requested()
+                    return self._mark_preflight_compression_requested(
+                        operation="compact",
+                        reason="deferred_maintenance",
+                        trigger="threshold",
+                    )
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = reason
                 logger.info("LCM preflight compression no-op: %s", reason)
@@ -203,12 +274,19 @@ class CompactionMixin:
                 replay_messages,
                 observed_tokens=replay_rough,
             ):
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="deferred_maintenance",
+                    trigger="critical_pressure",
+                )
             return False
         if self._compression_boundary_cooldown_active():
             return False
         if self._should_force_overflow_recovery(observed_tokens=rough):
-            return self._mark_preflight_compression_requested()
+            return self._mark_preflight_compression_requested(
+                operation="compact",
+                reason="overflow_recovery",
+            )
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
             if pre_ingest_placeholder_ambiguous_noop:
                 self._last_compression_status = "noop"
@@ -220,24 +298,55 @@ class CompactionMixin:
                 allow_partial_leaf=self._config.threshold_full_sweep_enabled,
             )
             if eligible:
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="eligible_leaf",
+                    trigger="threshold",
+                )
             if self._has_ignored_backlog_outside_fresh_tail(messages):
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="ignored_backlog",
+                    trigger="threshold",
+                )
             if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
-                return self._mark_preflight_compression_requested()
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="deferred_maintenance",
+                    trigger="threshold",
+                )
             self._last_compression_status = "noop"
             self._last_compression_noop_reason = reason
             logger.info("LCM preflight compression no-op: %s", reason)
             return False
         self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
-        if self._critical_budget_pressure_reached(
+        critical_pressure = self._critical_budget_pressure_reached(
             observed_tokens=rough,
             messages=messages,
-        ) and self._should_run_deferred_maintenance(
+        )
+        if critical_pressure:
+            eligible, _reason = self._leaf_compaction_candidate_status(messages)
+            if eligible:
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="eligible_leaf",
+                    trigger="critical_pressure",
+                )
+            if self._has_ignored_backlog_outside_fresh_tail(messages):
+                return self._mark_preflight_compression_requested(
+                    operation="compact",
+                    reason="ignored_backlog",
+                    trigger="critical_pressure",
+                )
+        if critical_pressure and self._should_run_deferred_maintenance(
             messages,
             observed_tokens=rough,
         ):
-            return self._mark_preflight_compression_requested()
+            return self._mark_preflight_compression_requested(
+                operation="compact",
+                reason="deferred_maintenance",
+                trigger="critical_pressure",
+            )
         return False
 
     def _replay_diff_requests_ingest_cleanup(
@@ -245,33 +354,45 @@ class CompactionMixin:
         original_messages: List[Dict[str, Any]],
         replay_messages: List[Dict[str, Any]],
     ) -> bool:
+        return bool(
+            self._replay_diff_ingest_cleanup_reason(
+                original_messages,
+                replay_messages,
+            )
+        )
+
+    def _replay_diff_ingest_cleanup_reason(
+        self,
+        original_messages: List[Dict[str, Any]],
+        replay_messages: List[Dict[str, Any]],
+    ) -> str:
         if len(original_messages) != len(replay_messages):
-            return True
+            return "count_change_sanitation"
         for original_msg, replay_msg in zip(original_messages, replay_messages):
             original_text = text_content_for_pattern_matching(original_msg.get("content")) or ""
             replay_text = text_content_for_pattern_matching(replay_msg.get("content")) or ""
             if original_text != replay_text:
                 if replay_text.startswith("[Externalized LCM ingest payload:"):
-                    return True
+                    return "externalization_sanitation"
                 if replay_text.startswith("[Externalized payload: kind=raw_payload;"):
-                    return True
+                    return "externalization_sanitation"
                 if replay_text.startswith("[Externalized tool output:"):
-                    return True
+                    return "externalization_sanitation"
                 if replay_text.startswith("[LCM active replay placeholder: assistant output quarantined;"):
-                    return True
+                    return "quarantine_sanitation"
                 if replay_text.startswith("[LCM active replay placeholder: message ignored;"):
-                    return True
+                    return "ignored_message_sanitation"
                 if "[LCM sensitive redaction:" in replay_text:
-                    return True
+                    return "redaction_sanitation"
             if original_msg.get("content") != replay_msg.get("content") and _contains_sensitive_redaction(
                 replay_msg.get("content")
             ):
-                return True
+                return "redaction_sanitation"
             if original_msg.get("tool_calls") != replay_msg.get("tool_calls") and _contains_sensitive_redaction(
                 replay_msg.get("tool_calls")
             ):
-                return True
-        return False
+                return "redaction_sanitation"
+        return ""
 
     def _has_ignored_backlog_outside_fresh_tail(self, messages: List[Dict[str, Any]]) -> bool:
         if not self._compiled_ignore_message_patterns or not messages:
@@ -423,6 +544,10 @@ class CompactionMixin:
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
         _compress_started = time.perf_counter()
+        if force:
+            logger.info(
+                "LCM compression decision operation=compact reason=manual_force"
+            )
 
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
@@ -932,7 +1057,11 @@ class CompactionMixin:
                 # next appended messages look already ingested. This applies to
                 # content-only cleanup as well as dropped-message cleanup.
                 self._ingest_cursor = len(sanitized_messages)
-                self._last_compression_status = "sanitized"
+                self._last_compression_status = (
+                    "reassembled"
+                    if dropped_replayed_scaffold_messages
+                    else "sanitized"
+                )
                 self._last_compression_noop_reason = ""
             else:
                 if dropped_replayed_scaffold_messages:

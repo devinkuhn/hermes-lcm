@@ -10879,7 +10879,7 @@ class TestEngineCompress:
         assert len(nodes) == 1
         assert nodes[0].node_id == node_id
         assert instance._ingest_cursor == len(result)
-        assert instance._last_compression_status == "sanitized"
+        assert instance._last_compression_status == "reassembled"
         assert instance._last_compression_noop_reason == ""
 
     def test_compress_handles_multimodal_first_user_message_without_system(self, engine, monkeypatch):
