@@ -423,7 +423,14 @@ class CompactionMixin:
             messages=messages,
         )
         if critical_pressure:
-            eligible, _reason = self._leaf_compaction_candidate_status(messages)
+            eligible, _reason = self._leaf_compaction_candidate_status(
+                messages,
+                allow_partial_leaf=bool(
+                    self._config.threshold_full_sweep_enabled
+                    and self.threshold_tokens > 0
+                    and rough >= self.threshold_tokens
+                ),
+            )
             if eligible:
                 return self._mark_preflight_compression_requested(
                     operation="compact",

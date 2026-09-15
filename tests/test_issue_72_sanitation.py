@@ -1288,6 +1288,52 @@ def test_sanitation_shrink_preserves_original_critical_pressure_operation(
     summary_spy.assert_called()
 
 
+def test_cooldown_allows_critical_partial_threshold_sweep_leaf(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(
+        tmp_path,
+        "cooldown-critical-partial-threshold-sweep",
+        fresh_tail_count=1,
+        leaf_chunk_tokens=50_000,
+        threshold_full_sweep_enabled=True,
+        sensitive_patterns_enabled=False,
+    )
+    messages = [
+        {"role": "user", "content": "tiny critical raw prefix"},
+        {"role": "assistant", "content": "tiny critical answer"},
+        {"role": "user", "content": "fresh"},
+    ]
+    rough = count_messages_tokens(messages)
+    engine.threshold_tokens = max(1, rough - 1)
+    engine._last_boundary_skip_time = time.time()
+    monkeypatch.setattr(
+        engine,
+        "_critical_budget_pressure_reached",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_has_ignored_backlog_outside_fresh_tail",
+        lambda _messages: False,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_should_run_deferred_maintenance",
+        lambda *_args, **_kwargs: False,
+    )
+    summary_spy = Mock(return_value=("critical partial sweep summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    result = engine.compress(deepcopy(messages), current_tokens=rough)
+
+    assert isinstance(result, list)
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
 def test_cooldown_preserves_unchanged_replay_critical_leaf_work(tmp_path):
     engine = _engine(
         tmp_path,
