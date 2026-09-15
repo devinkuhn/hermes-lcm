@@ -583,6 +583,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._preflight_cleanup_only = False
         self._sanitation_claim_lock = threading.RLock()
         self._pending_sanitation_claim = None
+        self._foreground_ingest_revision = 0
         # Temporary source window used only while compress() assembles context.
         # _assemble_context also serves tests and recovery paths directly, so
         # keep anchoring opt-in rather than changing its public behavior.
@@ -1645,21 +1646,22 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             return
         if self._session_id and messages:
-            try:
-                self._remember_lcm_normal_message_prefix(
-                    self._session_id,
-                    messages,
-                    conversation_id=self._conversation_id,
-                )
-                self._ingest_messages(messages)
-                self._record_ingest_success()
-                self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                logger.debug(
-                    "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
-                    self._session_id, len(messages), self._ingest_cursor,
-                )
-            except Exception as e:
-                self._record_ingest_failure("per-turn ingest()", e)
+            with self._sanitation_claim_lock:
+                try:
+                    self._remember_lcm_normal_message_prefix(
+                        self._session_id,
+                        messages,
+                        conversation_id=self._conversation_id,
+                    )
+                    self._ingest_messages(messages)
+                    self._record_ingest_success()
+                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    logger.debug(
+                        "Per-turn ingest OK: session=%s msgs=%d cursor=%d",
+                        self._session_id, len(messages), self._ingest_cursor,
+                    )
+                except Exception as e:
+                    self._record_ingest_failure("per-turn ingest()", e)
 
     def _is_retry_worthy_leaf_summary_error(self, exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -4868,6 +4870,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
 
         if not messages_to_store_with_index:
             self._ingest_cursor = n
+            self._foreground_ingest_revision += 1
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}
@@ -4924,6 +4927,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # would let a rebuild publish 'ready' from old sources and omit the leaf
         # (maintainer #388 P1).
         self._ingest_cursor = n
+        self._foreground_ingest_revision += 1
         self._compression_boundary_ingest_pending = False
         self._compression_boundary_active_placeholder_digest_budget = {}
         self._compression_boundary_active_placeholder_digest_ordinals = {}

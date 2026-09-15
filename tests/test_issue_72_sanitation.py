@@ -66,6 +66,25 @@ def test_should_compress_overflow_precedes_cooldown_for_public_gates(
     assert engine.should_compress(100) is False
 
 
+def test_overflow_is_recomputed_from_expanded_sanitized_replay(tmp_path):
+    engine = _engine(tmp_path, "overflow-after-replay-sanitation")
+    engine.threshold_tokens = 90_000
+    messages = [{"role": "user", "content": "api_key=abcdefghijkl"}]
+    sanitized = engine._redact_active_replay_messages(messages)
+    original_tokens = count_messages_tokens(messages)
+    sanitized_tokens = count_messages_tokens(sanitized)
+    assert sanitized_tokens > original_tokens
+    engine._config.max_assembly_tokens = original_tokens + 1
+    assert engine._config.max_assembly_tokens <= sanitized_tokens
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    result = engine.compress(deepcopy(messages))
+
+    assert result == sanitized
+    assert engine.last_compression_status == "overflow_recovery"
+    assert engine._last_overflow_recovery_failed is True
+
+
 def test_session_end_invalidates_only_bound_foreground_claim(tmp_path):
     engine = _engine(tmp_path, "session-end-claim")
     messages = [
@@ -86,15 +105,24 @@ def test_session_end_invalidates_only_bound_foreground_claim(tmp_path):
 
 def test_handoff_identity_includes_provider_visible_name_metadata(tmp_path):
     engine = _engine(tmp_path, "handoff-name-identity")
-    base = [{"role": "tool", "tool_call_id": "call-1", "name": "lookup", "content": "result"}]
+    base = [
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "name": "lookup",
+            "tool_name": "stored_lookup",
+            "content": "result",
+        }
+    ]
     changed = deepcopy(base)
     changed[0]["name"] = "admin_lookup"
-    persisted_equivalent = deepcopy(base)
-    persisted_equivalent[0].pop("name")
-    persisted_equivalent[0]["tool_name"] = "lookup"
+    changed_tool_name = deepcopy(base)
+    changed_tool_name[0]["tool_name"] = "stored_admin_lookup"
 
     assert engine._cleanup_handoff_message_identity(base) != engine._cleanup_handoff_message_identity(changed)
-    assert engine._cleanup_handoff_message_identity(base) == engine._cleanup_handoff_message_identity(persisted_equivalent)
+    assert engine._cleanup_handoff_message_identity(base) != engine._cleanup_handoff_message_identity(
+        changed_tool_name
+    )
 
 
 def test_engine_sidecar_loader_uses_configured_storage_and_rejects_traversal(tmp_path):
@@ -125,6 +153,8 @@ def test_engine_sidecar_loader_uses_configured_storage_and_rejects_traversal(tmp
         assert loaded["content"] == content
         assert engine.load_externalized_payload_sidecar("../payload.json") is None
         assert engine.load_externalized_payload_sidecar("missing.json") is None
+        (storage / "non-object.json").write_text("[]", encoding="utf-8")
+        assert engine.load_externalized_payload_sidecar("non-object.json") is None
     finally:
         engine.shutdown()
 
@@ -135,6 +165,7 @@ def _content_text(messages) -> str:
 
 def _claim_sanitation(engine, messages, *, generation: int = 1):
     engine._compression_attempt_generation = generation
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
     prepared = engine.prepare_compression_operation(
         deepcopy(messages),
         session_id=engine.bound_session_id,
@@ -227,6 +258,64 @@ def test_preflight_handoff_publication_is_atomic_with_prepare(
     assert not prepare_overtook_publication
     assert results["preflight"] is True
     assert results["prepare"] is not None
+
+
+def test_claim_execution_is_serialized_with_bound_session_end(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "claim-session-end-race")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-session-end-race-000000000",
+        }
+    ]
+    claim = _claim_sanitation(engine, messages, generation=34)
+    ingest_entered = threading.Event()
+    release_ingest = threading.Event()
+    invalidation_done = threading.Event()
+    session_end_done = threading.Event()
+    real_ingest = engine._ingest_messages
+    real_invalidate = engine._invalidate_sanitation_operation
+    results = {}
+
+    def blocked_ingest(candidate_messages):
+        ingest_entered.set()
+        assert release_ingest.wait(5)
+        return real_ingest(candidate_messages)
+
+    def track_invalidation():
+        real_invalidate()
+        invalidation_done.set()
+
+    monkeypatch.setattr(engine, "_ingest_messages", blocked_ingest)
+    monkeypatch.setattr(engine, "_invalidate_sanitation_operation", track_invalidation)
+    compressor = threading.Thread(
+        target=lambda: results.setdefault(
+            "compress",
+            engine.compress(deepcopy(messages), operation_claim=claim),
+        )
+    )
+    compressor.start()
+    assert ingest_entered.wait(5)
+
+    session_ender = threading.Thread(
+        target=lambda: (
+            engine.on_session_end(engine.bound_session_id, deepcopy(messages)),
+            session_end_done.set(),
+        )
+    )
+    session_ender.start()
+    lifecycle_overtook_claim_execution = invalidation_done.wait(0.2)
+    release_ingest.set()
+    compressor.join(5)
+    session_ender.join(5)
+
+    assert not lifecycle_overtook_claim_execution
+    assert session_end_done.is_set()
+    assert isinstance(results["compress"], tuple)
+    assert results["compress"][1] is claim
 
 
 def test_claimed_sanitation_returns_exact_opaque_claim_once(tmp_path, monkeypatch):
@@ -371,6 +460,96 @@ def test_attempt_generation_advance_invalidates_claim(tmp_path):
         engine.compress(deepcopy(messages), operation_claim=claim),
         list,
     )
+
+
+def test_preflight_handoff_without_host_attempt_can_be_claimed_by_first_generation(
+    tmp_path,
+):
+    engine = _engine(tmp_path, "preflight-before-host-attempt")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-preflight-before-host-attempt-000000",
+        }
+    ]
+    assert getattr(engine, "_compression_attempt_generation", None) is None
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+    engine._compression_attempt_generation = 1
+
+    prepared = engine.prepare_compression_operation(
+        deepcopy(messages),
+        session_id=engine.bound_session_id,
+        attempt_generation=1,
+    )
+    assert prepared is not None
+    assert prepared[0] == "sanitize"
+
+
+def test_preflight_handoff_cannot_be_claimed_by_later_attempt_generation(tmp_path):
+    engine = _engine(tmp_path, "stale-preflight-generation")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-stale-preflight-generation-000000",
+        }
+    ]
+    engine._compression_attempt_generation = 40
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+    engine._compression_attempt_generation = 41
+
+    assert (
+        engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id=engine.bound_session_id,
+            attempt_generation=41,
+        )
+        is None
+    )
+
+
+def test_preflight_after_host_persistence_rebinds_handoff_to_latest_revision(
+    tmp_path,
+):
+    engine = _engine(tmp_path, "preflight-after-host-persistence")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-repeated-preflight-ingest-000000",
+        }
+    ]
+    engine._compression_attempt_generation = 42
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    first_revision = engine._foreground_ingest_revision
+
+    engine._ingest_cursor = 0
+    engine._ingest_cursor_needs_reconcile = True
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+    assert engine._foreground_ingest_revision > first_revision
+    prepared = engine.prepare_compression_operation(
+        deepcopy(messages),
+        session_id=engine.bound_session_id,
+        attempt_generation=42,
+    )
+    assert prepared is not None
+
+
+def test_intervening_foreground_ingest_invalidates_sanitation_claim(tmp_path):
+    engine = _engine(tmp_path, "claim-foreground-ingest-revision")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-foreground-ingest-revision-000000",
+        }
+    ]
+    claim = _claim_sanitation(engine, messages, generation=42)
+    engine.ingest(messages + [{"role": "assistant", "content": "intervening durable turn"}])
+
+    result = engine.compress(deepcopy(messages), operation_claim=claim)
+
+    assert not (isinstance(result, tuple) and result[1] is claim)
 
 
 def test_intervening_preflight_invalidates_claim(tmp_path):
@@ -1496,6 +1675,7 @@ def test_cooldown_cleanup_handoff_above_threshold_stays_sanitation_only(
     ]
     rough = count_messages_tokens(messages)
     engine.threshold_tokens = max(1, rough - 1)
+    engine._compression_attempt_generation = 31
     summary_spy = Mock(
         side_effect=AssertionError(
             "cooldown-authorized sanitation must not summarize"
@@ -1507,7 +1687,6 @@ def test_cooldown_cleanup_handoff_above_threshold_stays_sanitation_only(
     assert engine._preflight_cleanup_only is True
 
     if caller == "host_claim":
-        engine._compression_attempt_generation = 31
         prepared = engine.prepare_compression_operation(
             deepcopy(messages),
             session_id=engine.bound_session_id,

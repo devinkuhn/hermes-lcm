@@ -963,6 +963,8 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    if not isinstance(payload, dict):
+        return None
     summary = _externalized_summary(path, payload)
     summary["content"] = payload.get("content", "")
     return summary

@@ -54,10 +54,8 @@ class CompactionMixin:
         for message in messages:
             for field in self._message_replay_identity(message):
                 _update_cleanup_handoff_digest(digest, field)
-            _update_cleanup_handoff_digest(
-                digest,
-                str(message.get("name") or message.get("tool_name") or ""),
-            )
+            _update_cleanup_handoff_digest(digest, str(message.get("name") or ""))
+            _update_cleanup_handoff_digest(digest, str(message.get("tool_name") or ""))
         return digest.hexdigest()
 
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
@@ -86,6 +84,11 @@ class CompactionMixin:
             self._pending_sanitation_claim = None
             self._preflight_cleanup_only = False
             self._preflight_cleanup_handoff = None
+            current_generation = getattr(
+                self,
+                "_compression_attempt_generation",
+                None,
+            )
             if (
                 handoff is None
                 or handoff[0] != self._session_id
@@ -95,8 +98,12 @@ class CompactionMixin:
                 or session_id != self._session_id
                 or isinstance(attempt_generation, bool)
                 or not isinstance(attempt_generation, int)
-                or attempt_generation
-                != getattr(self, "_compression_attempt_generation", None)
+                or (
+                    handoff[5] is not None
+                    and handoff[5] != attempt_generation
+                )
+                or attempt_generation != current_generation
+                or handoff[6] != getattr(self, "_foreground_ingest_revision", 0)
             ):
                 return None
             claim = object()
@@ -185,6 +192,13 @@ class CompactionMixin:
         if self._session_id and messages:
             try:
                 replay_messages = self._ingest_messages(messages)
+                # The handoff must describe the revision produced by this
+                # preflight ingest, including a no-new-rows replay refresh.
+                preflight_ingest_revision = getattr(
+                    self,
+                    "_foreground_ingest_revision",
+                    0,
+                )
                 self._record_ingest_success()
             except Exception as e:
                 # Fail closed for NORMAL threshold compaction: the store did not
@@ -265,6 +279,8 @@ class CompactionMixin:
                         self._cleanup_handoff_message_identity(messages),
                         self._cleanup_handoff_message_identity(replay_messages),
                         cleanup_cooldown_authorized,
+                        getattr(self, "_compression_attempt_generation", None),
+                        preflight_ingest_revision,
                     )
                 cleanup_trigger = ""
                 if force_overflow_requested:
@@ -626,24 +642,40 @@ class CompactionMixin:
                  ):
         """Run compaction and leave a terminal public status on every failure."""
         with self._sanitation_claim_lock:
-            pending_claim = self._pending_sanitation_claim
-            compatibility_handoff = getattr(
-                self,
-                "_preflight_cleanup_handoff",
-                None,
+            return self._compress_locked(
+                messages,
+                current_tokens=current_tokens,
+                focus_topic=focus_topic,
+                force=force,
+                operation_claim=operation_claim,
             )
-            preserve_foreground_sanitation_state = bool(
-                self._bypasses_lcm_context_management()
-                and operation_claim is None
-                and (pending_claim is not None or compatibility_handoff is not None)
-            )
-            if preserve_foreground_sanitation_state:
-                pending_claim = None
-                compatibility_handoff = None
-            else:
-                self._pending_sanitation_claim = None
-                self._preflight_cleanup_only = False
-                self._preflight_cleanup_handoff = None
+
+    def _compress_locked(self, messages: List[Dict[str, Any]],
+                         current_tokens: int = None,
+                         focus_topic: Optional[str] = None,
+                         force: bool = False,
+                         operation_claim: object = None) -> (
+                             List[Dict[str, Any]]
+                             | tuple[List[Dict[str, Any]], object]
+                         ):
+        pending_claim = self._pending_sanitation_claim
+        compatibility_handoff = getattr(
+            self,
+            "_preflight_cleanup_handoff",
+            None,
+        )
+        preserve_foreground_sanitation_state = bool(
+            self._bypasses_lcm_context_management()
+            and operation_claim is None
+            and (pending_claim is not None or compatibility_handoff is not None)
+        )
+        if preserve_foreground_sanitation_state:
+            pending_claim = None
+            compatibility_handoff = None
+        else:
+            self._pending_sanitation_claim = None
+            self._preflight_cleanup_only = False
+            self._preflight_cleanup_handoff = None
         host_claimed_sanitation = bool(
             pending_claim is not None
             and operation_claim is pending_claim[0]
@@ -654,6 +686,8 @@ class CompactionMixin:
             and pending_claim[2] == self._session_id
             and pending_claim[3]
             == getattr(self, "_compression_attempt_generation", None)
+            and pending_claim[1][6]
+            == getattr(self, "_foreground_ingest_revision", 0)
             and not force
         )
         compatibility_sanitation = bool(
@@ -664,6 +698,10 @@ class CompactionMixin:
             and compatibility_handoff[1] == self._conversation_id
             and compatibility_handoff[2]
             == self._cleanup_handoff_message_identity(messages)
+            and compatibility_handoff[5]
+            == getattr(self, "_compression_attempt_generation", None)
+            and compatibility_handoff[6]
+            == getattr(self, "_foreground_ingest_revision", 0)
             and not force
         )
         claimed_sanitation = host_claimed_sanitation or compatibility_sanitation
@@ -749,15 +787,6 @@ class CompactionMixin:
         # compaction loop produces - clearing it per turn would defeat the guard
         # in the case it exists for. A tripped guard still converges the
         # emergency via deterministic L3 truncation (no LLM spend).
-        recovery_assembly_cap = (
-            self._overflow_recovery_assembly_cap(
-                observed_tokens=observed_prompt_tokens,
-                messages=messages,
-            )
-            if force_overflow
-            else None
-        )
-
         # Step 1: Ingest new messages into the immutable store. Work from a
         # replay-safe view so quarantined assistant loops do not enter summaries
         # or provider context after the durable row has been written.
@@ -773,6 +802,20 @@ class CompactionMixin:
         )
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        force_overflow = self._should_force_overflow_recovery(
+            observed_tokens=observed_prompt_tokens,
+            messages=working_messages,
+        )
+        recovery_assembly_cap = (
+            self._overflow_recovery_assembly_cap(
+                observed_tokens=observed_prompt_tokens,
+                messages=working_messages,
+            )
+            if force_overflow
+            else None
+        )
+        if force_overflow:
+            cleanup_handoff_matches_request = False
         cleanup_observed_tokens = max(
             count_messages_tokens(messages),
             count_messages_tokens(working_messages),
