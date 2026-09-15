@@ -2622,7 +2622,6 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self._log_session_filter_diagnostics()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
-        self._invalidate_sanitation_operation()
         if "hermes_home" in kwargs:
             self._rebind_storage_for_home(str(kwargs.get("hermes_home") or ""))
 
@@ -2809,6 +2808,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return
             if self._compression_boundary_from_lcm_bypassed_session(old_session_id):
+                self._invalidate_sanitation_operation()
                 self._handoff_lcm_bypass_lineage(
                     old_session_id,
                     session_id,
@@ -2839,6 +2839,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 )
                 return
             self._clear_thread_context_stateless()
+            self._invalidate_sanitation_operation()
             self._continue_compression_boundary(session_id, old_session_id, kwargs)
             return
 
@@ -2867,6 +2868,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 previous_session_id,
             )
             return
+        self._invalidate_sanitation_operation()
         start_platform = str(kwargs.get("platform") or "")
         side_channel_rebind = self._session_id_matches_lcm_bypass_filters(
             session_id,

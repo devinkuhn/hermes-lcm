@@ -15,6 +15,7 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,13 @@ _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
+def _update_cleanup_handoff_digest(digest: Any, value: str) -> None:
+    digest.update(f"{len(value)}:".encode("ascii"))
+    for offset in range(0, len(value), 65_536):
+        digest.update(value[offset : offset + 65_536].encode("utf-8", errors="surrogatepass"))
+    digest.update(b";")
+
+
 class CompactionMixin:
     def _invalidate_sanitation_operation(self) -> None:
         with self._sanitation_claim_lock:
@@ -40,8 +48,13 @@ class CompactionMixin:
     def _cleanup_handoff_message_identity(
         self,
         messages: List[Dict[str, Any]],
-    ) -> tuple[tuple[str, str, str, str], ...]:
-        return tuple(self._message_replay_identity(message) for message in messages)
+    ) -> str:
+        digest = hashlib.sha256()
+        digest.update(f"{len(messages)}:".encode("ascii"))
+        for message in messages:
+            for field in self._message_replay_identity(message):
+                _update_cleanup_handoff_digest(digest, field)
+        return digest.hexdigest()
 
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
@@ -115,6 +128,10 @@ class CompactionMixin:
 
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
+        with self._sanitation_claim_lock:
+            return self._should_compress_preflight_locked(messages)
+
+    def _should_compress_preflight_locked(self, messages):
         self._invalidate_sanitation_operation()
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
         if self._bypasses_lcm_context_management():
@@ -1212,7 +1229,11 @@ class CompactionMixin:
                     active_context_messages,
                     insert_missing_tool_stubs=False,
                 )
-            if sanitized_messages != working_messages or ingest_cleanup_changed_active_context:
+            if (
+                dropped_replayed_scaffold_messages
+                or sanitized_messages != working_messages
+                or ingest_cleanup_changed_active_context
+            ):
                 # _ingest_messages() already advanced the cursor to the original
                 # active-context length. If the host continues from a sanitized
                 # or reassembled context, keeping the old cursor could make the
@@ -1226,11 +1247,6 @@ class CompactionMixin:
                 )
                 self._last_compression_noop_reason = ""
             else:
-                if dropped_replayed_scaffold_messages:
-                    # The active context changed even though no new leaf node was
-                    # written. Keep the cursor aligned with the returned context
-                    # so the next appended turn is ingested instead of skipped.
-                    self._ingest_cursor = len(sanitized_messages)
                 self._last_compression_status = "noop"
                 self._last_compression_noop_reason = noop_reason
                 logger.info("LCM compression no-op: %s", noop_reason)

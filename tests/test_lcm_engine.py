@@ -10817,8 +10817,8 @@ class TestEngineCompress:
         assert len(result) < len(messages)
         assert instance._ingest_cursor == len(result)
         assert nodes == []
-        assert instance._last_compression_status == "noop"
-        assert "raw store lineage" in instance._last_compression_noop_reason
+        assert instance._last_compression_status == "reassembled"
+        assert instance._last_compression_noop_reason == ""
 
     def test_compress_reassembles_backed_active_summary_marker_on_noop(
         self,

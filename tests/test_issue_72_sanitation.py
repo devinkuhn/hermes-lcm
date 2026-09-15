@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from copy import deepcopy
 from unittest.mock import Mock
@@ -60,6 +61,88 @@ def _claim_sanitation(engine, messages, *, generation: int = 1):
     assert operation == "sanitize"
     assert claim is not None
     return claim
+
+
+def test_cleanup_handoff_identity_bounds_expanded_replay_payload(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "bounded-handoff-identity")
+    payload = "large-externalized-payload-" * 50_000
+    messages = [{"role": "tool", "tool_call_id": "call-large", "content": payload}]
+    replay_identity = Mock(
+        return_value=("tool", payload, "call-large", "")
+    )
+    monkeypatch.setattr(
+        engine,
+        "_message_replay_identity",
+        replay_identity,
+    )
+
+    identity = engine._cleanup_handoff_message_identity(messages)
+
+    assert len(identity) == 64
+    assert payload not in identity
+    replay_identity.assert_called_once_with(messages[0])
+    replay_identity.reset_mock()
+    replay_identity.return_value = ("tool", payload + "changed", "call-large", "")
+    assert identity != engine._cleanup_handoff_message_identity(
+        [{"role": "tool", "tool_call_id": "call-large", "content": payload + "changed"}]
+    )
+
+
+def test_preflight_handoff_publication_is_atomic_with_prepare(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "atomic-handoff-publication")
+    engine.threshold_tokens = 90_000
+    engine._compression_attempt_generation = 33
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-atomic-handoff-000000000000",
+        }
+    ]
+    ingest_entered = threading.Event()
+    release_ingest = threading.Event()
+    prepare_done = threading.Event()
+    real_ingest = engine._ingest_messages
+    results = {}
+
+    def blocked_ingest(candidate_messages):
+        ingest_entered.set()
+        assert release_ingest.wait(5)
+        return real_ingest(candidate_messages)
+
+    monkeypatch.setattr(engine, "_ingest_messages", blocked_ingest)
+    preflight = threading.Thread(
+        target=lambda: results.setdefault(
+            "preflight",
+            engine.should_compress_preflight(deepcopy(messages)),
+        )
+    )
+    preflight.start()
+    assert ingest_entered.wait(5)
+
+    def prepare():
+        results["prepare"] = engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id=engine.bound_session_id,
+            attempt_generation=33,
+        )
+        prepare_done.set()
+
+    preparer = threading.Thread(target=prepare)
+    preparer.start()
+    prepare_overtook_publication = prepare_done.wait(0.2)
+    release_ingest.set()
+    preflight.join(5)
+    preparer.join(5)
+
+    assert not prepare_overtook_publication
+    assert results["preflight"] is True
+    assert results["prepare"] is not None
 
 
 def test_claimed_sanitation_returns_exact_opaque_claim_once(tmp_path, monkeypatch):
@@ -255,6 +338,44 @@ def test_session_change_and_rebind_invalidates_claim(tmp_path):
     result = engine.compress(deepcopy(messages), operation_claim=claim)
 
     assert isinstance(result, list)
+
+
+def test_ignored_live_auxiliary_start_preserves_foreground_claim(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "claim-live-auxiliary-start")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-live-auxiliary-claim-000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=32)
+    pending_claim = engine._pending_sanitation_claim
+    monkeypatch.setattr(
+        engine,
+        "_is_live_auxiliary_child_session",
+        lambda *_args, **_kwargs: True,
+    )
+
+    engine.on_session_start(
+        "ignored-auxiliary-child",
+        platform="synthetic",
+        parent_session_id=engine.bound_session_id,
+        context_length=100_000,
+    )
+
+    assert engine._pending_sanitation_claim is pending_claim
+    sanitized, returned_claim = engine.compress(
+        deepcopy(messages),
+        operation_claim=claim,
+    )
+    assert returned_claim is claim
+    assert engine.last_compression_status == "sanitized"
+    assert "sk-synthetic-live-auxiliary-claim" not in _content_text(sanitized)
 
 
 def test_session_reset_invalidates_claim(tmp_path):
@@ -589,6 +710,31 @@ def test_no_leaf_scaffold_reassembly_has_distinct_status(tmp_path, monkeypatch):
 
     claim = object()
     assert engine.compress(messages, operation_claim=claim) == messages
+    assert engine.last_compression_status == "reassembled"
+
+
+def test_stale_scaffold_removal_reports_reassembled_when_assembly_matches(tmp_path):
+    engine = _engine(
+        tmp_path,
+        "stale-scaffold-reassembled-status",
+        fresh_tail_count=1,
+        sensitive_patterns_enabled=False,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "[Recent Summary (d0, node 999999)]\n"
+                "retired compressed details\n"
+                "[Expand for details: retired]"
+            ),
+        },
+        {"role": "user", "content": "fresh question"},
+    ]
+
+    result = engine.compress(deepcopy(messages), operation_claim=object())
+
+    assert result == [{"role": "user", "content": "fresh question"}]
     assert engine.last_compression_status == "reassembled"
 
 
