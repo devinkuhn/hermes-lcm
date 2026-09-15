@@ -845,6 +845,137 @@ def test_cooldown_preserves_unchanged_replay_critical_deferred_maintenance(
     assert engine.should_compress_preflight(deepcopy(messages)) is True
 
 
+@pytest.mark.parametrize("caller", ["host_claim", "direct"])
+def test_cooldown_cleanup_handoff_above_threshold_stays_sanitation_only(
+    tmp_path,
+    monkeypatch,
+    caller,
+):
+    engine = _engine(
+        tmp_path,
+        f"cooldown-cleanup-threshold-{caller}",
+        fresh_tail_count=1,
+        threshold_full_sweep_enabled=False,
+    )
+    engine._last_boundary_skip_time = time.time()
+    messages = [
+        {"role": "user", "content": "old eligible backlog " * 40},
+        {"role": "assistant", "content": "old eligible answer"},
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-cooldown-threshold-" + ("x" * 3_000),
+        },
+    ]
+    rough = count_messages_tokens(messages)
+    engine.threshold_tokens = max(1, rough - 1)
+    summary_spy = Mock(
+        side_effect=AssertionError(
+            "cooldown-authorized sanitation must not summarize"
+        )
+    )
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    assert engine._preflight_cleanup_only is True
+
+    if caller == "host_claim":
+        engine._compression_attempt_generation = 31
+        prepared = engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id=engine.bound_session_id,
+            attempt_generation=31,
+        )
+        assert prepared is not None
+        operation, claim = prepared
+        assert operation == "sanitize"
+        engine._last_boundary_skip_time = 0
+        sanitized, returned_claim = engine.compress(
+            deepcopy(messages),
+            current_tokens=rough,
+            operation_claim=claim,
+        )
+        assert returned_claim is claim
+    else:
+        engine._last_boundary_skip_time = 0
+        sanitized = engine.compress(
+            deepcopy(messages),
+            current_tokens=rough,
+        )
+
+    assert engine.last_compression_status == "sanitized"
+    assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+    assert "sk-synthetic-cooldown-threshold" not in _content_text(sanitized)
+    summary_spy.assert_not_called()
+
+
+def test_direct_compress_without_current_tokens_preserves_cleanup_pressure_for_deferred(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(
+        tmp_path,
+        "direct-no-current-preserve-pressure",
+        fresh_tail_count=1,
+        leaf_chunk_tokens=5_000,
+        dynamic_leaf_chunk_enabled=False,
+        threshold_full_sweep_enabled=False,
+        critical_budget_pressure_ratio=0.8,
+    )
+    engine.context_length = 1_000
+    engine.threshold_tokens = 90_000
+    messages = [
+        {"role": "user", "content": "old eligible request"},
+        {"role": "assistant", "content": "old eligible answer"},
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-direct-no-current-" + ("x" * 4_000),
+        },
+    ]
+    rough = count_messages_tokens(messages)
+    critical_floor = int(
+        engine.context_length * engine._config.critical_budget_pressure_ratio
+    )
+    replays = []
+    real_ingest = engine._ingest_messages
+
+    def capture_replay(candidate_messages):
+        replay = real_ingest(candidate_messages)
+        replays.append(deepcopy(replay))
+        return replay
+
+    monkeypatch.setattr(engine, "_ingest_messages", capture_replay)
+    monkeypatch.setattr(
+        engine,
+        "_has_ignored_backlog_outside_fresh_tail",
+        lambda _messages: False,
+    )
+    maintenance_observed_tokens = []
+
+    def deferred_maintenance_due(_messages, *, observed_tokens=None):
+        maintenance_observed_tokens.append(observed_tokens)
+        return True
+
+    monkeypatch.setattr(
+        engine,
+        "_should_run_deferred_maintenance",
+        deferred_maintenance_due,
+    )
+    summary_spy = Mock(return_value=("direct no-current summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert rough >= critical_floor
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    assert count_messages_tokens(replays[0]) < critical_floor
+    assert engine._preflight_cleanup_only is False
+
+    result = engine.compress(deepcopy(messages))
+
+    assert isinstance(result, list)
+    assert engine.last_compression_status == "compacted"
+    assert maintenance_observed_tokens[-1] == rough
+    summary_spy.assert_called()
+
+
 def test_cleanup_state_is_cleared_before_fallible_ingest_and_cannot_hijack_force(
     tmp_path,
     monkeypatch,

@@ -192,6 +192,9 @@ class CompactionMixin:
                 # sanitization, may publish below threshold but must not
                 # piggyback summary work. Configured critical pressure still
                 # permits declared compaction work, so cleanup must not swallow it.
+                cleanup_cooldown_authorized = (
+                    self._compression_boundary_cooldown_active()
+                )
                 critical_pressure = self._critical_budget_pressure_reached(
                     observed_tokens=cleanup_observed_tokens,
                     messages=replay_messages,
@@ -215,7 +218,7 @@ class CompactionMixin:
                     not force_overflow_requested
                     and not critical_compaction_due
                     and (
-                        self._compression_boundary_cooldown_active()
+                        cleanup_cooldown_authorized
                         or self.threshold_tokens <= 0
                         or cleanup_observed_tokens < self.threshold_tokens
                     )
@@ -226,6 +229,7 @@ class CompactionMixin:
                         self._conversation_id,
                         self._cleanup_handoff_message_identity(messages),
                         self._cleanup_handoff_message_identity(replay_messages),
+                        cleanup_cooldown_authorized,
                     )
                 cleanup_trigger = ""
                 if force_overflow_requested:
@@ -725,6 +729,11 @@ class CompactionMixin:
             self.threshold_tokens > 0
             and cleanup_observed_tokens >= self.threshold_tokens
         )
+        cleanup_cooldown_authorized = bool(
+            cleanup_handoff
+            and len(cleanup_handoff) > 4
+            and cleanup_handoff[4]
+        )
         cleanup_critical_compaction_due = False
         if self._critical_budget_pressure_reached(
             observed_tokens=cleanup_observed_tokens,
@@ -745,7 +754,7 @@ class CompactionMixin:
             cleanup_handoff_matches_request
             and cleanup_handoff[3]
             == self._cleanup_handoff_message_identity(working_messages)
-            and not cleanup_threshold_reached
+            and (cleanup_cooldown_authorized or not cleanup_threshold_reached)
             and not cleanup_critical_compaction_due
         )
         if preflight_cleanup_only:
@@ -813,8 +822,9 @@ class CompactionMixin:
                 "stop_reason": "",
                 "budget_exhausted": False,
             }
+        downstream_observed_tokens = cleanup_observed_tokens
         critical_budget_pressure = self._critical_budget_pressure_reached(
-            observed_tokens=observed_prompt_tokens,
+            observed_tokens=downstream_observed_tokens,
             messages=working_messages,
         )
         deferred_maintenance_active = (
@@ -822,7 +832,7 @@ class CompactionMixin:
             and not threshold_full_sweep_active
             and self._should_run_deferred_maintenance(
                 working_messages,
-                observed_tokens=observed_prompt_tokens,
+                observed_tokens=downstream_observed_tokens,
             )
         )
         if deferred_maintenance_active:
