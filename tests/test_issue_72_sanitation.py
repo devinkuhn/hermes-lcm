@@ -45,6 +45,58 @@ def _engine(tmp_path, name: str, **overrides) -> LCMEngine:
     return engine
 
 
+def test_should_compress_overflow_precedes_cooldown_for_public_gates(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "overflow-before-cooldown")
+    engine.threshold_tokens = 100
+    engine._last_boundary_skip_time = time.time()
+    monkeypatch.setattr(
+        engine,
+        "_should_force_overflow_recovery",
+        lambda **kwargs: kwargs["observed_tokens"] >= 1_000,
+    )
+
+    assert engine.should_compress(1_000) is True
+    assert engine.should_compress(100) is False
+
+    monkeypatch.setattr(engine, "_bypasses_lcm_context_management", lambda: True)
+    assert engine.should_compress(1_000) is True
+    assert engine.should_compress(100) is False
+
+
+def test_session_end_invalidates_only_bound_foreground_claim(tmp_path):
+    engine = _engine(tmp_path, "session-end-claim")
+    messages = [
+        {"role": "user", "content": "api_key=sk-session-end-secret"},
+        {"role": "user", "content": "fresh"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages)
+
+    engine.on_session_end(engine.bound_session_id, deepcopy(messages))
+    result = engine.compress(
+        deepcopy(messages),
+        operation_claim=claim,
+        current_tokens=count_messages_tokens(messages),
+    )
+    assert not (isinstance(result, tuple) and result[1] is claim)
+
+
+def test_handoff_identity_includes_provider_visible_name_metadata(tmp_path):
+    engine = _engine(tmp_path, "handoff-name-identity")
+    base = [{"role": "tool", "tool_call_id": "call-1", "name": "lookup", "content": "result"}]
+    changed = deepcopy(base)
+    changed[0]["name"] = "admin_lookup"
+    persisted_equivalent = deepcopy(base)
+    persisted_equivalent[0].pop("name")
+    persisted_equivalent[0]["tool_name"] = "lookup"
+
+    assert engine._cleanup_handoff_message_identity(base) != engine._cleanup_handoff_message_identity(changed)
+    assert engine._cleanup_handoff_message_identity(base) == engine._cleanup_handoff_message_identity(persisted_equivalent)
+
+
 def test_engine_sidecar_loader_uses_configured_storage_and_rejects_traversal(tmp_path):
     engine = _engine(tmp_path, "sidecar-loader")
     try:

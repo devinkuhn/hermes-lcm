@@ -54,6 +54,10 @@ class CompactionMixin:
         for message in messages:
             for field in self._message_replay_identity(message):
                 _update_cleanup_handoff_digest(digest, field)
+            _update_cleanup_handoff_digest(
+                digest,
+                str(message.get("name") or message.get("tool_name") or ""),
+            )
         return digest.hexdigest()
 
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
@@ -106,8 +110,6 @@ class CompactionMixin:
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._bypasses_lcm_context_management():
-            if self._compression_boundary_cooldown_active():
-                return False
             if prompt_tokens is not None:
                 tokens = prompt_tokens
             else:
@@ -118,14 +120,16 @@ class CompactionMixin:
                     tokens = self.last_prompt_tokens
             if self._should_force_overflow_recovery(observed_tokens=tokens):
                 return True
+            if self._compression_boundary_cooldown_active():
+                return False
             if self.threshold_tokens <= 0:
                 return False
             return tokens >= self.threshold_tokens
-        if self._compression_boundary_cooldown_active():
-            return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self._should_force_overflow_recovery(observed_tokens=tokens):
             return True
+        if self._compression_boundary_cooldown_active():
+            return False
         if self.threshold_tokens <= 0:
             return False
         return tokens >= self.threshold_tokens
