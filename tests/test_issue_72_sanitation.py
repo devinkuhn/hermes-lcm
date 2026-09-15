@@ -447,6 +447,122 @@ def test_auxiliary_preflight_does_not_invalidate_foreground_sanitation_claim(tmp
     )
 
 
+def test_auxiliary_prepare_preserves_foreground_sanitation_claim(
+    tmp_path,
+    monkeypatch,
+):
+    class HostAgentFrame:
+        def __init__(self, session_id: str, parent_session_id: str, hermes_home: str):
+            self.session_id = session_id
+            self._parent_session_id = parent_session_id
+            self._hermes_home = hermes_home
+            self.enabled_toolsets = ["memory", "skills"]
+            self.log_prefix = "[subagent-test] "
+            self._subagent_id = session_id
+            self._delegate_depth = 1
+
+        def on_session_start(self, engine: LCMEngine) -> None:
+            engine.on_session_start(
+                self.session_id,
+                hermes_home=self._hermes_home,
+                platform="telegram",
+                context_length=100_000,
+            )
+
+        def prepare(self, engine: LCMEngine, messages, *, generation: int):
+            assert engine.should_compress_preflight(messages) is True
+            return engine.prepare_compression_operation(
+                messages,
+                session_id=self.session_id,
+                attempt_generation=generation,
+            )
+
+    engine = _engine(tmp_path, "claim-auxiliary-prepare-shared-engine")
+    engine.threshold_tokens = 90_000
+    foreground_messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-auxiliary-prepare-claim-0000000000000",
+        }
+    ]
+    monkeypatch.setattr(
+        lcm_engine,
+        "summarize_with_escalation",
+        Mock(side_effect=AssertionError("claimed sanitation must not summarize")),
+    )
+
+    assert engine.should_compress_preflight(deepcopy(foreground_messages)) is True
+    claim = _claim_sanitation(engine, foreground_messages, generation=75)
+    pending_claim = engine._pending_sanitation_claim
+
+    child = HostAgentFrame(
+        "background-review-session",
+        engine.current_session_id,
+        str(engine._hermes_home),
+    )
+    child.on_session_start(engine)
+    engine.threshold_tokens = 1
+    assert (
+        child.prepare(
+            engine,
+            [{"role": "user", "content": "above-threshold auxiliary payload"}],
+            generation=75,
+        )
+        is None
+    )
+    assert (
+        engine._pending_sanitation_claim is pending_claim
+    ), "auxiliary preparation consumed a foreground sanitation claim"
+
+    engine.threshold_tokens = 90_000
+    sanitized, returned_claim = engine.compress(
+        deepcopy(foreground_messages),
+        operation_claim=claim,
+    )
+    assert returned_claim is claim
+    assert engine.last_compression_status == "sanitized"
+    assert "sk-synthetic-auxiliary-prepare-claim" not in _content_text(sanitized)
+
+
+def test_mismatched_session_prepare_preserves_claim_but_foreground_stale_mismatch_invalidates(
+    tmp_path,
+):
+    engine = _engine(tmp_path, "claim-prepare-mismatch")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-prepare-mismatch-0000000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=76)
+    pending_claim = engine._pending_sanitation_claim
+
+    assert (
+        engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id="different-host-session",
+            attempt_generation=76,
+        )
+        is None
+    )
+    assert engine._pending_sanitation_claim is pending_claim
+    assert (
+        engine.prepare_compression_operation(
+            [{"role": "user", "content": "stale foreground payload"}],
+            session_id=engine.bound_session_id,
+            attempt_generation=76,
+        )
+        is None
+    )
+    assert engine._pending_sanitation_claim is None
+    assert isinstance(
+        engine.compress(deepcopy(messages), operation_claim=claim),
+        list,
+    )
+
+
 def test_auxiliary_compress_bypass_preserves_foreground_sanitation_claim(
     tmp_path,
     monkeypatch,

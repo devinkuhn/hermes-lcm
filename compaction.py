@@ -74,6 +74,10 @@ class CompactionMixin:
     ) -> tuple[str, object] | None:
         """Claim one preflight-proven pure-sanitation invocation."""
         with self._sanitation_claim_lock:
+            if self._bypasses_lcm_context_management() or (
+                session_id and session_id != self._session_id
+            ):
+                return None
             handoff = getattr(self, "_preflight_cleanup_handoff", None)
             self._pending_sanitation_claim = None
             self._preflight_cleanup_only = False
