@@ -690,6 +690,74 @@ def test_replay_cleanup_does_not_swallow_critical_leaf_compaction(
     summary_spy.assert_called()
 
 
+@pytest.mark.parametrize("caller", ["host_claim", "direct"])
+def test_sanitation_shrink_preserves_original_critical_pressure_operation(
+    tmp_path,
+    monkeypatch,
+    caller,
+):
+    engine = _engine(
+        tmp_path,
+        f"cleanup-critical-shrink-{caller}",
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+        critical_budget_pressure_ratio=0.8,
+    )
+    engine.context_length = 1_000
+    engine.threshold_tokens = 90_000
+    messages = [
+        {"role": "user", "content": "eligible old request"},
+        {"role": "assistant", "content": "eligible old answer"},
+        {
+            "role": "user",
+            "content": f"api_key=sk-synthetic-critical-shrink-{'x' * 4_000}",
+        },
+    ]
+    rough = count_messages_tokens(messages)
+    critical_floor = int(
+        engine.context_length * engine._config.critical_budget_pressure_ratio
+    )
+    replays = []
+    real_ingest = engine._ingest_messages
+
+    def capture_replay(candidate_messages):
+        replay = real_ingest(candidate_messages)
+        replays.append(deepcopy(replay))
+        return replay
+
+    monkeypatch.setattr(engine, "_ingest_messages", capture_replay)
+    summary_spy = Mock(return_value=("critical shrink summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert rough >= critical_floor
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    assert count_messages_tokens(replays[0]) < critical_floor
+    assert engine._preflight_cleanup_only is False
+
+    operation_claim = None
+    prepared = None
+    if caller == "host_claim":
+        engine._compression_attempt_generation = 23
+        prepared = engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id=engine.bound_session_id,
+            attempt_generation=23,
+        )
+        if prepared is not None:
+            _operation, operation_claim = prepared
+
+    result = engine.compress(
+        deepcopy(messages),
+        current_tokens=rough,
+        operation_claim=operation_claim,
+    )
+
+    assert prepared is None
+    assert isinstance(result, list)
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
 def test_cooldown_preserves_unchanged_replay_critical_leaf_work(tmp_path):
     engine = _engine(
         tmp_path,

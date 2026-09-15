@@ -175,6 +175,7 @@ class CompactionMixin:
                 return False
         if replay_messages is not None and replay_messages != messages:
             replay_rough = count_messages_tokens(replay_messages)
+            cleanup_observed_tokens = max(rough, replay_rough)
             cleanup_reason = self._replay_diff_ingest_cleanup_reason(
                 messages,
                 replay_messages,
@@ -192,7 +193,7 @@ class CompactionMixin:
                 # piggyback summary work. Configured critical pressure still
                 # permits declared compaction work, so cleanup must not swallow it.
                 critical_pressure = self._critical_budget_pressure_reached(
-                    observed_tokens=replay_rough,
+                    observed_tokens=cleanup_observed_tokens,
                     messages=replay_messages,
                 )
                 critical_compaction_due = False
@@ -207,7 +208,7 @@ class CompactionMixin:
                         )
                         or self._should_run_deferred_maintenance(
                             replay_messages,
-                            observed_tokens=replay_rough,
+                            observed_tokens=cleanup_observed_tokens,
                         )
                     )
                 if (
@@ -216,7 +217,7 @@ class CompactionMixin:
                     and (
                         self._compression_boundary_cooldown_active()
                         or self.threshold_tokens <= 0
-                        or max(rough, replay_rough) < self.threshold_tokens
+                        or cleanup_observed_tokens < self.threshold_tokens
                     )
                 ):
                     self._preflight_cleanup_only = True
@@ -233,7 +234,7 @@ class CompactionMixin:
                     cleanup_trigger = "critical_pressure"
                 elif (
                     self.threshold_tokens > 0
-                    and max(rough, replay_rough) >= self.threshold_tokens
+                    and cleanup_observed_tokens >= self.threshold_tokens
                 ):
                     cleanup_trigger = "threshold"
                 return self._mark_preflight_compression_requested(
