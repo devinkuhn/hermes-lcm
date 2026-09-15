@@ -378,6 +378,75 @@ def test_ignored_live_auxiliary_start_preserves_foreground_claim(
     assert "sk-synthetic-live-auxiliary-claim" not in _content_text(sanitized)
 
 
+def test_auxiliary_preflight_does_not_invalidate_foreground_sanitation_claim(tmp_path):
+    class HostAgentFrame:
+        def __init__(self, session_id: str, parent_session_id: str, hermes_home: str):
+            self.session_id = session_id
+            self._parent_session_id = parent_session_id
+            self._hermes_home = hermes_home
+            self.enabled_toolsets = ["memory", "skills"]
+            self.log_prefix = "[subagent-test] "
+            self._subagent_id = session_id
+            self._delegate_depth = 1
+
+        def on_session_start(self, engine: LCMEngine) -> None:
+            engine.on_session_start(
+                self.session_id,
+                hermes_home=self._hermes_home,
+                platform="telegram",
+                context_length=100_000,
+            )
+
+        def should_compress_preflight(self, engine: LCMEngine, messages):
+            return engine.should_compress_preflight(messages)
+
+    engine = _engine(tmp_path, "claim-auxiliary-preflight-shared-engine")
+    engine.threshold_tokens = 90_000
+    foreground_messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-shared-engine-claim-000000000000",
+        }
+    ]
+    assert engine.should_compress_preflight(deepcopy(foreground_messages)) is True
+    claim = _claim_sanitation(engine, foreground_messages, generation=72)
+
+    child = HostAgentFrame(
+        "background-review-session",
+        engine.current_session_id,
+        str(engine._hermes_home),
+    )
+    child.on_session_start(engine)
+    assert child.should_compress_preflight(
+        engine,
+        [{"role": "user", "content": "shared-engine auxiliary payload"}],
+    ) is False
+
+    claimed_result = engine.compress(
+        deepcopy(foreground_messages),
+        current_tokens=count_messages_tokens(foreground_messages),
+        operation_claim=claim,
+    )
+    assert isinstance(
+        claimed_result,
+        tuple,
+    ), "auxiliary preflight invalidated a foreground sanitation claim"
+    sanitized, returned_claim = claimed_result
+    assert returned_claim is claim
+    assert engine.last_compression_status == "sanitized"
+    assert "sk-synthetic-shared-engine-claim" not in _content_text(sanitized)
+
+    assert engine.should_compress_preflight(deepcopy(foreground_messages)) is True
+    second_claim = _claim_sanitation(engine, foreground_messages, generation=73)
+    assert engine.should_compress_preflight(
+        [{"role": "user", "content": "foreground intervening preflight"}]
+    ) is False
+    assert isinstance(
+        engine.compress(deepcopy(foreground_messages), operation_claim=second_claim),
+        list,
+    )
+
+
 def test_session_reset_invalidates_claim(tmp_path):
     engine = _engine(
         tmp_path,

@@ -132,9 +132,11 @@ class CompactionMixin:
             return self._should_compress_preflight_locked(messages)
 
     def _should_compress_preflight_locked(self, messages):
-        self._invalidate_sanitation_operation()
         self._maybe_reclassify_late_auxiliary_before_compaction_write()
-        if self._bypasses_lcm_context_management():
+        bypasses_lcm_context_management = self._bypasses_lcm_context_management()
+        if not bypasses_lcm_context_management:
+            self._invalidate_sanitation_operation()
+        if bypasses_lcm_context_management:
             self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
             rough = count_messages_tokens(messages)
             if self._should_force_overflow_recovery(observed_tokens=rough, messages=messages):
