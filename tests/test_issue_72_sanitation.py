@@ -45,6 +45,38 @@ def _engine(tmp_path, name: str, **overrides) -> LCMEngine:
     return engine
 
 
+def test_engine_sidecar_loader_uses_configured_storage_and_rejects_traversal(tmp_path):
+    engine = _engine(tmp_path, "sidecar-loader")
+    try:
+        storage = tmp_path / "sidecar-loader-externalized"
+        storage.mkdir(parents=True, exist_ok=True)
+        content = "durable tool output"
+        ref = "payload.json"
+        (storage / ref).write_text(
+            json.dumps(
+                {
+                    "kind": "tool_result",
+                    "tool_call_id": "call-sidecar",
+                    "content": content,
+                    "content_chars": len(content),
+                    "content_bytes": len(content.encode("utf-8")),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = engine.load_externalized_payload_sidecar(ref)
+
+        assert loaded is not None
+        assert loaded["kind"] == "tool_result"
+        assert loaded["tool_call_id"] == "call-sidecar"
+        assert loaded["content"] == content
+        assert engine.load_externalized_payload_sidecar("../payload.json") is None
+        assert engine.load_externalized_payload_sidecar("missing.json") is None
+    finally:
+        engine.shutdown()
+
+
 def _content_text(messages) -> str:
     return json.dumps(messages, ensure_ascii=False, sort_keys=True)
 

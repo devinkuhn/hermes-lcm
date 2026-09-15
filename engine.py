@@ -387,6 +387,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
       5. Active context = system prompt + DAG summaries + fresh tail
     """
 
+    def load_externalized_payload_sidecar(self, ref: str) -> Dict[str, Any] | None:
+        """Load one externalized payload through LCM's public safe reader."""
+        return load_externalized_payload(
+            ref,
+            config=self._config,
+            hermes_home=self._hermes_home,
+        )
+
     def __init__(self, config: LCMConfig | None = None,
                  hermes_home: str = ""):
         self._config = config or LCMConfig.from_env()
