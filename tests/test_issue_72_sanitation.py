@@ -371,6 +371,146 @@ def test_generic_compression_never_echoes_unrecognized_claim(tmp_path):
     assert isinstance(result, list)
 
 
+def test_direct_exact_preflight_consumes_sanitation_without_claim_echo(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "direct-exact")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {"role": "user", "content": "old eligible backlog " * 20},
+        {
+            "role": "assistant",
+            "content": "api_key=sk-synthetic-direct-exact-000000000000000",
+        },
+        {"role": "user", "content": "fresh"},
+    ]
+    monkeypatch.setattr(
+        lcm_engine,
+        "summarize_with_escalation",
+        Mock(side_effect=AssertionError("direct sanitation must not summarize")),
+    )
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    result = engine.compress(
+        deepcopy(messages),
+        current_tokens=count_messages_tokens(messages),
+    )
+
+    assert isinstance(result, list)
+    assert engine.last_compression_status == "sanitized"
+    assert engine._dag.get_session_node_count(engine.current_session_id) == 0
+    assert "sk-synthetic-direct-exact" not in _content_text(result)
+
+
+def test_direct_handoff_message_mismatch_remains_generic(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, "direct-message-mismatch", fresh_tail_count=1)
+    engine.threshold_tokens = 90_000
+    cleanup_messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-direct-mismatch-000000000000",
+        },
+        {"role": "assistant", "content": "fresh cleanup answer"},
+    ]
+    unrelated_messages = [
+        {"role": "user", "content": "unrelated eligible backlog " * 20},
+        {"role": "assistant", "content": "unrelated eligible answer"},
+        {"role": "user", "content": "fresh"},
+    ]
+    summary_spy = Mock(return_value=("generic mismatch summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(deepcopy(cleanup_messages)) is True
+    result = engine.compress(
+        deepcopy(unrelated_messages),
+        current_tokens=count_messages_tokens(unrelated_messages),
+    )
+
+    assert isinstance(result, list)
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
+def test_direct_handoff_session_change_remains_generic(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, "direct-session-change", fresh_tail_count=1)
+    engine.threshold_tokens = 90_000
+    cleanup_messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-direct-session-0000000000000",
+        }
+    ]
+    next_session_messages = [
+        {"role": "user", "content": "next-session eligible backlog " * 20},
+        {"role": "assistant", "content": "next-session eligible answer"},
+        {"role": "user", "content": "fresh"},
+    ]
+    summary_spy = Mock(return_value=("next-session summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(deepcopy(cleanup_messages)) is True
+    engine.on_session_start(
+        "direct-session-change-next",
+        platform="synthetic",
+        conversation_id="direct-session-change-next-conversation",
+        context_length=100_000,
+    )
+    result = engine.compress(
+        deepcopy(next_session_messages),
+        current_tokens=count_messages_tokens(next_session_messages),
+    )
+
+    assert isinstance(result, list)
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
+@pytest.mark.parametrize("mode", ["threshold", "manual", "overflow"])
+def test_direct_handoff_compaction_trigger_remains_generic(
+    tmp_path,
+    monkeypatch,
+    mode,
+):
+    engine = _engine(
+        tmp_path,
+        f"direct-{mode}",
+        fresh_tail_count=1,
+        threshold_full_sweep_enabled=False,
+    )
+    engine.threshold_tokens = 90_000
+    messages = [
+        {"role": "user", "content": f"{mode} eligible backlog " * 20},
+        {
+            "role": "assistant",
+            "content": f"api_key=sk-synthetic-direct-{mode}-000000000000000",
+        },
+        {"role": "user", "content": "fresh"},
+    ]
+    rough = count_messages_tokens(messages)
+    summary_spy = Mock(return_value=(f"{mode} summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    if mode == "threshold":
+        engine.threshold_tokens = rough
+    elif mode == "overflow":
+        monkeypatch.setattr(
+            engine,
+            "_should_force_overflow_recovery",
+            lambda **_kwargs: True,
+        )
+    result = engine.compress(
+        deepcopy(messages),
+        current_tokens=rough,
+        force=mode == "manual",
+    )
+
+    assert isinstance(result, list)
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
 def test_below_floor_replay_cleanup_is_pure_sanitation(tmp_path, monkeypatch):
     engine = _engine(tmp_path, "below-floor")
     engine.threshold_tokens = 90_000

@@ -581,7 +581,14 @@ class CompactionMixin:
         with self._sanitation_claim_lock:
             pending_claim = self._pending_sanitation_claim
             self._pending_sanitation_claim = None
-        claimed_sanitation = bool(
+            compatibility_handoff = getattr(
+                self,
+                "_preflight_cleanup_handoff",
+                None,
+            )
+            self._preflight_cleanup_only = False
+            self._preflight_cleanup_handoff = None
+        host_claimed_sanitation = bool(
             pending_claim is not None
             and operation_claim is pending_claim[0]
             and pending_claim[1][0] == self._session_id
@@ -593,6 +600,22 @@ class CompactionMixin:
             == getattr(self, "_compression_attempt_generation", None)
             and not force
         )
+        compatibility_sanitation = bool(
+            pending_claim is None
+            and operation_claim is None
+            and compatibility_handoff is not None
+            and compatibility_handoff[0] == self._session_id
+            and compatibility_handoff[1] == self._conversation_id
+            and compatibility_handoff[2]
+            == self._cleanup_handoff_message_identity(messages)
+            and not force
+        )
+        claimed_sanitation = host_claimed_sanitation or compatibility_sanitation
+        sanitation_handoff = (
+            pending_claim[1]
+            if host_claimed_sanitation
+            else compatibility_handoff if compatibility_sanitation else None
+        )
         try:
             result = self._compress_impl(
                 messages,
@@ -600,11 +623,9 @@ class CompactionMixin:
                 focus_topic=focus_topic,
                 force=force,
                 claimed_sanitation=claimed_sanitation,
-                claimed_sanitation_handoff=(
-                    pending_claim[1] if claimed_sanitation else None
-                ),
+                claimed_sanitation_handoff=sanitation_handoff,
             )
-            if claimed_sanitation and self._last_compression_status == "sanitized":
+            if host_claimed_sanitation and self._last_compression_status == "sanitized":
                 return result, operation_claim
             return result
         except BaseException:
@@ -690,14 +711,41 @@ class CompactionMixin:
             and not force_overflow
             and not force
         )
-        self._preflight_cleanup_only = False
-        self._preflight_cleanup_handoff = None
         working_messages = self._ingest_messages(messages)
         ingest_cleanup_changed_active_context = working_messages != messages
+        cleanup_observed_tokens = max(
+            count_messages_tokens(messages),
+            count_messages_tokens(working_messages),
+            observed_prompt_tokens
+            if observed_prompt_tokens is not None and observed_prompt_tokens > 0
+            else 0,
+        )
+        cleanup_threshold_reached = bool(
+            self.threshold_tokens > 0
+            and cleanup_observed_tokens >= self.threshold_tokens
+        )
+        cleanup_critical_compaction_due = False
+        if self._critical_budget_pressure_reached(
+            observed_tokens=cleanup_observed_tokens,
+            messages=working_messages,
+        ):
+            critical_leaf_eligible, _critical_leaf_reason = (
+                self._leaf_compaction_candidate_status(working_messages)
+            )
+            cleanup_critical_compaction_due = (
+                critical_leaf_eligible
+                or self._has_ignored_backlog_outside_fresh_tail(working_messages)
+                or self._should_run_deferred_maintenance(
+                    working_messages,
+                    observed_tokens=cleanup_observed_tokens,
+                )
+            )
         preflight_cleanup_only = bool(
             cleanup_handoff_matches_request
             and cleanup_handoff[3]
             == self._cleanup_handoff_message_identity(working_messages)
+            and not cleanup_threshold_reached
+            and not cleanup_critical_compaction_due
         )
         if preflight_cleanup_only:
             sanitized_messages = self._sanitize_active_context_messages(
