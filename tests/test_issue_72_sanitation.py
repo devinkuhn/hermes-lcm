@@ -447,6 +447,81 @@ def test_auxiliary_preflight_does_not_invalidate_foreground_sanitation_claim(tmp
     )
 
 
+def test_auxiliary_compress_bypass_preserves_foreground_sanitation_claim(
+    tmp_path,
+    monkeypatch,
+):
+    class HostAgentFrame:
+        def __init__(self, session_id: str, parent_session_id: str, hermes_home: str):
+            self.session_id = session_id
+            self._parent_session_id = parent_session_id
+            self._hermes_home = hermes_home
+            self.enabled_toolsets = ["memory", "skills"]
+            self.log_prefix = "[subagent-test] "
+            self._subagent_id = session_id
+            self._delegate_depth = 1
+
+        def on_session_start(self, engine: LCMEngine) -> None:
+            engine.on_session_start(
+                self.session_id,
+                hermes_home=self._hermes_home,
+                platform="telegram",
+                context_length=100_000,
+            )
+
+        def compress(self, engine: LCMEngine, messages, **kwargs):
+            return engine.compress(messages, **kwargs)
+
+    engine = _engine(tmp_path, "claim-auxiliary-compress-shared-engine", fresh_tail_count=1)
+    engine.threshold_tokens = 90_000
+    foreground_messages = [
+        {"role": "user", "content": "old eligible backlog " * 20},
+        {"role": "assistant", "content": "old eligible answer " * 20},
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-auxiliary-compress-claim-0000000000000",
+        },
+        {"role": "assistant", "content": "fresh follow-up"},
+    ]
+    monkeypatch.setattr(
+        lcm_engine,
+        "summarize_with_escalation",
+        Mock(side_effect=AssertionError("claimed sanitation must not summarize")),
+    )
+
+    assert engine.should_compress_preflight(deepcopy(foreground_messages)) is True
+    claim = _claim_sanitation(engine, foreground_messages, generation=74)
+    pending_claim = engine._pending_sanitation_claim
+
+    child = HostAgentFrame(
+        "background-review-session",
+        engine.current_session_id,
+        str(engine._hermes_home),
+    )
+    child.on_session_start(engine)
+    child.compress(
+        engine,
+        [{"role": "user", "content": "shared-engine auxiliary payload"}],
+    )
+
+    assert (
+        engine._pending_sanitation_claim is pending_claim
+    ), "auxiliary bypass compression consumed a foreground sanitation claim"
+    claimed_result = engine.compress(
+        deepcopy(foreground_messages),
+        current_tokens=count_messages_tokens(foreground_messages),
+        operation_claim=claim,
+    )
+    assert isinstance(
+        claimed_result,
+        tuple,
+    ), "foreground sanitation claim was not echoed after auxiliary bypass compression"
+    sanitized, returned_claim = claimed_result
+    assert returned_claim is claim
+    assert engine.last_compression_status == "sanitized"
+    assert "sk-synthetic-auxiliary-compress-claim" not in _content_text(sanitized)
+
+
 def test_session_reset_invalidates_claim(tmp_path):
     engine = _engine(
         tmp_path,
@@ -620,6 +695,44 @@ def test_direct_handoff_message_mismatch_remains_generic(tmp_path, monkeypatch):
     assert isinstance(result, list)
     assert engine.last_compression_status == "compacted"
     summary_spy.assert_called()
+
+
+def test_claim_echo_requires_post_ingest_handoff_match(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "claim-echo-handoff-match")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-claim-echo-handoff-match-0000000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=27)
+    mismatched_replay = deepcopy(messages)
+    mismatched_replay[0][
+        "content"
+    ] = "api_key=sk-synthetic-claim-echo-handoff-mutated-0000000000000"
+    monkeypatch.setattr(
+        engine,
+        "_ingest_messages",
+        Mock(return_value=mismatched_replay),
+    )
+
+    result = engine.compress(
+        deepcopy(messages),
+        current_tokens=count_messages_tokens(messages),
+        operation_claim=claim,
+    )
+
+    assert isinstance(
+        result,
+        list,
+    ), "claim echo must require the post-ingest replay handoff to match"
+    assert engine.last_compression_status == "sanitized"
 
 
 def test_direct_handoff_session_change_remains_generic(tmp_path, monkeypatch):
@@ -901,6 +1014,60 @@ def test_replay_cleanup_does_not_swallow_critical_leaf_compaction(
     assert engine._preflight_cleanup_only is False
     engine.compress(deepcopy(messages), current_tokens=rough)
 
+    assert engine.last_compression_status == "compacted"
+    summary_spy.assert_called()
+
+
+def test_cleanup_critical_partial_leaf_is_not_classified_sanitation_only(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(
+        tmp_path,
+        "cleanup-critical-partial-leaf",
+        fresh_tail_count=1,
+        leaf_chunk_tokens=50_000,
+        threshold_full_sweep_enabled=True,
+    )
+    messages = [
+        {"role": "user", "content": "tiny critical raw prefix"},
+        {
+            "role": "assistant",
+            "content": "api_key=sk-synthetic-critical-partial-leaf-0000000000000",
+        },
+        {"role": "user", "content": "fresh"},
+    ]
+    rough = count_messages_tokens(messages)
+    engine.threshold_tokens = max(1, rough - 1)
+    engine._last_boundary_skip_time = time.time()
+    monkeypatch.setattr(
+        engine,
+        "_critical_budget_pressure_reached",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_has_ignored_backlog_outside_fresh_tail",
+        lambda _messages: False,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_should_run_deferred_maintenance",
+        lambda *_args, **_kwargs: False,
+    )
+    summary_spy = Mock(return_value=("critical partial leaf summary", 1))
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", summary_spy)
+
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    assert (
+        engine._preflight_cleanup_only is False
+    ), "critical partial leaves under threshold sweep must not be sanitation-only"
+    result = engine.compress(
+        deepcopy(messages),
+        current_tokens=rough,
+    )
+
+    assert isinstance(result, list)
     assert engine.last_compression_status == "compacted"
     summary_spy.assert_called()
 

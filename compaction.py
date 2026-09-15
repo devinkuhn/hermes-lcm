@@ -218,10 +218,18 @@ class CompactionMixin:
                     observed_tokens=cleanup_observed_tokens,
                     messages=replay_messages,
                 )
+                cleanup_threshold_full_sweep_active = bool(
+                    self._config.threshold_full_sweep_enabled
+                    and self.threshold_tokens > 0
+                    and cleanup_observed_tokens >= self.threshold_tokens
+                )
                 critical_compaction_due = False
                 if critical_pressure:
                     critical_leaf_eligible, _critical_leaf_reason = (
-                        self._leaf_compaction_candidate_status(replay_messages)
+                        self._leaf_compaction_candidate_status(
+                            replay_messages,
+                            allow_partial_leaf=cleanup_threshold_full_sweep_active,
+                        )
                     )
                     critical_compaction_due = (
                         critical_leaf_eligible
@@ -604,14 +612,23 @@ class CompactionMixin:
         """Run compaction and leave a terminal public status on every failure."""
         with self._sanitation_claim_lock:
             pending_claim = self._pending_sanitation_claim
-            self._pending_sanitation_claim = None
             compatibility_handoff = getattr(
                 self,
                 "_preflight_cleanup_handoff",
                 None,
             )
-            self._preflight_cleanup_only = False
-            self._preflight_cleanup_handoff = None
+            preserve_foreground_sanitation_state = bool(
+                self._bypasses_lcm_context_management()
+                and operation_claim is None
+                and (pending_claim is not None or compatibility_handoff is not None)
+            )
+            if preserve_foreground_sanitation_state:
+                pending_claim = None
+                compatibility_handoff = None
+            else:
+                self._pending_sanitation_claim = None
+                self._preflight_cleanup_only = False
+                self._preflight_cleanup_handoff = None
         host_claimed_sanitation = bool(
             pending_claim is not None
             and operation_claim is pending_claim[0]
@@ -649,7 +666,10 @@ class CompactionMixin:
                 claimed_sanitation=claimed_sanitation,
                 claimed_sanitation_handoff=sanitation_handoff,
             )
-            if host_claimed_sanitation and self._last_compression_status == "sanitized":
+            if (
+                host_claimed_sanitation
+                and getattr(self, "_last_preflight_cleanup_only_executed", False)
+            ):
                 return result, operation_claim
             return result
         except BaseException:
@@ -678,6 +698,7 @@ class CompactionMixin:
 
         self._last_compression_status = "running"
         self._last_compression_noop_reason = ""
+        self._last_preflight_cleanup_only_executed = False
         _compress_started = time.perf_counter()
         if force:
             logger.info(
@@ -754,12 +775,20 @@ class CompactionMixin:
             and cleanup_handoff[4]
         )
         cleanup_critical_compaction_due = False
+        cleanup_threshold_full_sweep_active = bool(
+            self._config.threshold_full_sweep_enabled
+            and self.threshold_tokens > 0
+            and cleanup_observed_tokens >= self.threshold_tokens
+        )
         if self._critical_budget_pressure_reached(
             observed_tokens=cleanup_observed_tokens,
             messages=working_messages,
         ):
             critical_leaf_eligible, _critical_leaf_reason = (
-                self._leaf_compaction_candidate_status(working_messages)
+                self._leaf_compaction_candidate_status(
+                    working_messages,
+                    allow_partial_leaf=cleanup_threshold_full_sweep_active,
+                )
             )
             cleanup_critical_compaction_due = (
                 critical_leaf_eligible
@@ -777,6 +806,7 @@ class CompactionMixin:
             and not cleanup_critical_compaction_due
         )
         if preflight_cleanup_only:
+            self._last_preflight_cleanup_only_executed = True
             sanitized_messages = self._sanitize_active_context_messages(
                 working_messages,
                 insert_missing_tool_stubs=False,
