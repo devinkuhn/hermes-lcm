@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from .dag import SummaryNode
 from .message_content import text_content_for_pattern_matching
 from .sanitize import _contains_sensitive_redaction
+from .store import _normalize_observed_at
 from .tokens import count_message_tokens, count_messages_tokens, count_tokens
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,15 @@ class CompactionMixin:
                 _update_cleanup_handoff_digest(digest, field)
             _update_cleanup_handoff_digest(digest, str(message.get("name") or ""))
             _update_cleanup_handoff_digest(digest, str(message.get("tool_name") or ""))
+            normalized_observed_at = _normalize_observed_at(message.get("timestamp"))
+            # Digest the same normalized host timestamp the store persists as
+            # observed_at (empty for untrusted/absent values) so a timestamp
+            # changed between preflight and preparation consumes the handoff
+            # instead of validating the claim against divergent time metadata.
+            _update_cleanup_handoff_digest(
+                digest,
+                "" if normalized_observed_at is None else repr(normalized_observed_at),
+            )
         return digest.hexdigest()
 
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
@@ -640,91 +650,101 @@ class CompactionMixin:
                      List[Dict[str, Any]]
                      | tuple[List[Dict[str, Any]], object]
                  ):
-        """Run compaction and leave a terminal public status on every failure."""
-        with self._sanitation_claim_lock:
-            return self._compress_locked(
-                messages,
-                current_tokens=current_tokens,
-                focus_topic=focus_topic,
-                force=force,
-                operation_claim=operation_claim,
-            )
+        """Run compaction and leave a terminal public status on every failure.
 
-    def _compress_locked(self, messages: List[Dict[str, Any]],
-                         current_tokens: int = None,
-                         focus_topic: Optional[str] = None,
-                         force: bool = False,
-                         operation_claim: object = None) -> (
-                             List[Dict[str, Any]]
-                             | tuple[List[Dict[str, Any]], object]
-                         ):
-        pending_claim = self._pending_sanitation_claim
-        compatibility_handoff = getattr(
-            self,
-            "_preflight_cleanup_handoff",
-            None,
-        )
-        preserve_foreground_sanitation_state = bool(
-            self._bypasses_lcm_context_management()
-            and operation_claim is None
-            and (pending_claim is not None or compatibility_handoff is not None)
-        )
-        if preserve_foreground_sanitation_state:
-            pending_claim = None
-            compatibility_handoff = None
-        else:
-            self._pending_sanitation_claim = None
-            self._preflight_cleanup_only = False
-            self._preflight_cleanup_handoff = None
-        host_claimed_sanitation = bool(
-            pending_claim is not None
-            and operation_claim is pending_claim[0]
-            and pending_claim[1][0] == self._session_id
-            and pending_claim[1][1] == self._conversation_id
-            and pending_claim[1][2]
-            == self._cleanup_handoff_message_identity(messages)
-            and pending_claim[2] == self._session_id
-            and pending_claim[3]
-            == getattr(self, "_compression_attempt_generation", None)
-            and pending_claim[1][6]
-            == getattr(self, "_foreground_ingest_revision", 0)
-            and not force
-        )
-        compatibility_sanitation = bool(
-            pending_claim is None
-            and operation_claim is None
-            and compatibility_handoff is not None
-            and compatibility_handoff[0] == self._session_id
-            and compatibility_handoff[1] == self._conversation_id
-            and compatibility_handoff[2]
-            == self._cleanup_handoff_message_identity(messages)
-            and compatibility_handoff[5]
-            == getattr(self, "_compression_attempt_generation", None)
-            and compatibility_handoff[6]
-            == getattr(self, "_foreground_ingest_revision", 0)
-            and not force
-        )
-        claimed_sanitation = host_claimed_sanitation or compatibility_sanitation
-        sanitation_handoff = (
-            pending_claim[1]
-            if host_claimed_sanitation
-            else compatibility_handoff if compatibility_sanitation else None
-        )
+        The claim lock is held to atomically consume sanitation state and to
+        serialize an actually-claimed sanitation execution with bound session
+        end. Unclaimed compression — including model-backed summarization that
+        can run for the full sweep budget — executes OUTSIDE the lock so a
+        concurrent ``on_session_end`` can invalidate claims without waiting
+        through summarization.
+        """
+        with self._sanitation_claim_lock:
+            pending_claim = self._pending_sanitation_claim
+            compatibility_handoff = getattr(
+                self,
+                "_preflight_cleanup_handoff",
+                None,
+            )
+            preserve_foreground_sanitation_state = bool(
+                self._bypasses_lcm_context_management()
+                and operation_claim is None
+                and (pending_claim is not None or compatibility_handoff is not None)
+            )
+            if preserve_foreground_sanitation_state:
+                pending_claim = None
+                compatibility_handoff = None
+            else:
+                self._pending_sanitation_claim = None
+                self._preflight_cleanup_only = False
+                self._preflight_cleanup_handoff = None
+            host_claimed_sanitation = bool(
+                pending_claim is not None
+                and operation_claim is pending_claim[0]
+                and pending_claim[1][0] == self._session_id
+                and pending_claim[1][1] == self._conversation_id
+                and pending_claim[1][2]
+                == self._cleanup_handoff_message_identity(messages)
+                and pending_claim[2] == self._session_id
+                and pending_claim[3]
+                == getattr(self, "_compression_attempt_generation", None)
+                and pending_claim[1][6]
+                == getattr(self, "_foreground_ingest_revision", 0)
+                and not force
+            )
+            compatibility_sanitation = bool(
+                pending_claim is None
+                and operation_claim is None
+                and compatibility_handoff is not None
+                and compatibility_handoff[0] == self._session_id
+                and compatibility_handoff[1] == self._conversation_id
+                and compatibility_handoff[2]
+                == self._cleanup_handoff_message_identity(messages)
+                and compatibility_handoff[5]
+                == getattr(self, "_compression_attempt_generation", None)
+                and compatibility_handoff[6]
+                == getattr(self, "_foreground_ingest_revision", 0)
+                and not force
+            )
+            claimed_sanitation = host_claimed_sanitation or compatibility_sanitation
+            sanitation_handoff = (
+                pending_claim[1]
+                if host_claimed_sanitation
+                else compatibility_handoff if compatibility_sanitation else None
+            )
+            if claimed_sanitation:
+                # Claimed sanitation is summarize-free and bounded; keep it
+                # under the lock so claim execution stays serialized with a
+                # bound session end (which invalidates claims under the same
+                # lock before its own bounded flush).
+                try:
+                    result = self._compress_impl(
+                        messages,
+                        current_tokens=current_tokens,
+                        focus_topic=focus_topic,
+                        force=force,
+                        claimed_sanitation=True,
+                        claimed_sanitation_handoff=sanitation_handoff,
+                    )
+                except BaseException:
+                    self._last_compression_status = "error"
+                    self._last_compression_noop_reason = ""
+                    raise
+                if (
+                    host_claimed_sanitation
+                    and getattr(self, "_last_preflight_cleanup_only_executed", False)
+                ):
+                    return result, operation_claim
+                return result
         try:
-            result = self._compress_impl(
+            return self._compress_impl(
                 messages,
                 current_tokens=current_tokens,
                 focus_topic=focus_topic,
                 force=force,
-                claimed_sanitation=claimed_sanitation,
-                claimed_sanitation_handoff=sanitation_handoff,
+                claimed_sanitation=False,
+                claimed_sanitation_handoff=None,
             )
-            if (
-                host_claimed_sanitation
-                and getattr(self, "_last_preflight_cleanup_only_executed", False)
-            ):
-                return result, operation_claim
-            return result
         except BaseException:
             self._last_compression_status = "error"
             self._last_compression_noop_reason = ""

@@ -643,6 +643,16 @@ def resolve_large_output_storage_dir(config, hermes_home: str = "") -> Path:
 
 
 def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Defensive: legacy/hand-written payload files may carry non-string
+    # content. Never raise while summarizing; report unknown sizes instead
+    # (the store writer always persists str content).
+    content = payload.get("content")
+    if not isinstance(content, str):
+        content_chars = None
+        content_bytes = None
+    else:
+        content_chars = payload.get("content_chars", len(content))
+        content_bytes = payload.get("content_bytes", len(content.encode("utf-8")))
     return {
         "ref": path.name,
         "kind": payload.get("kind", "tool_result"),
@@ -650,8 +660,8 @@ def _externalized_summary(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]
         "role": payload.get("role", ""),
         "session_id": payload.get("session_id", ""),
         "field_path": payload.get("field_path", ""),
-        "content_chars": payload.get("content_chars", len(payload.get("content", ""))),
-        "content_bytes": payload.get("content_bytes", len((payload.get("content", "") or "").encode("utf-8"))),
+        "content_chars": content_chars,
+        "content_bytes": content_bytes,
         "created_at": payload.get("created_at"),
     }
 
@@ -964,6 +974,11 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
     except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
+        return None
+    # The public safe reader must never surface a payload whose content the
+    # callers treat as text: malformed legacy files degrade to None instead
+    # of raising or returning non-string content.
+    if not isinstance(payload.get("content"), str):
         return None
     summary = _externalized_summary(path, payload)
     summary["content"] = payload.get("content", "")

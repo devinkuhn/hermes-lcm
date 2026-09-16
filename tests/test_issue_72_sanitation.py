@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -15,6 +16,7 @@ import hermes_lcm.engine as lcm_engine
 from hermes_lcm.config import LCMConfig
 from hermes_lcm.dag import SummaryNode
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.externalize import _externalized_summary
 from hermes_lcm.tokens import count_messages_tokens
 
 
@@ -2145,3 +2147,356 @@ def test_positive_preflight_and_manual_force_logs_are_reason_coded_and_content_f
             force=True,
         )
     assert "operation=compact reason=manual_force" in caplog.text
+
+
+def test_cleanup_handoff_identity_includes_normalized_timestamp(tmp_path):
+    engine = _engine(tmp_path, "handoff-timestamp-identity")
+    base = [{"role": "user", "content": "same content", "timestamp": 1750000000.0}]
+
+    changed_epoch = deepcopy(base)
+    changed_epoch[0]["timestamp"] = 1750000001.0
+    same_instant_iso = deepcopy(base)
+    same_instant_iso[0]["timestamp"] = "2025-06-15T15:06:40+00:00"
+    same_instant_offset = deepcopy(base)
+    same_instant_offset[0]["timestamp"] = "2025-06-15T11:06:40-04:00"
+    numeric_string = deepcopy(base)
+    numeric_string[0]["timestamp"] = "1750000000.0"
+    missing_timestamp = [{"role": "user", "content": "same content"}]
+    naive_rejected = deepcopy(base)
+    naive_rejected[0]["timestamp"] = "2025-07-15T16:26:40"
+
+    base_identity = engine._cleanup_handoff_message_identity(base)
+    assert base_identity != engine._cleanup_handoff_message_identity(changed_epoch)
+    assert base_identity != engine._cleanup_handoff_message_identity(missing_timestamp)
+    assert base_identity != engine._cleanup_handoff_message_identity(naive_rejected)
+    assert base_identity == engine._cleanup_handoff_message_identity(same_instant_iso)
+    assert base_identity == engine._cleanup_handoff_message_identity(same_instant_offset)
+    assert base_identity == engine._cleanup_handoff_message_identity(numeric_string)
+
+
+def test_timestamp_change_between_preflight_and_prepare_consumes_handoff(tmp_path):
+    engine = _engine(tmp_path, "handoff-timestamp-claim")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-handoff-timestamp-000000000000",
+            "timestamp": "2025-06-15T15:06:40+00:00",
+        },
+        {"role": "assistant", "content": "fresh answer", "timestamp": 1750000000.5},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    stale_timestamp = deepcopy(messages)
+    stale_timestamp[0]["timestamp"] = 1750000009.0
+
+    assert (
+        engine.prepare_compression_operation(
+            stale_timestamp,
+            session_id=engine.bound_session_id,
+            attempt_generation=1,
+        )
+        is None
+    ), "a changed message timestamp must consume the published handoff"
+    assert engine._preflight_cleanup_handoff is None, (
+        "the stale-timestamp prepare must consume the handoff atomically"
+    )
+
+    # A fresh preflight of the unchanged replay republishes a handoff that
+    # the original generation can still claim.
+    engine._compression_attempt_generation = 1
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    prepared = engine.prepare_compression_operation(
+        deepcopy(messages),
+        session_id=engine.bound_session_id,
+        attempt_generation=1,
+    )
+    assert prepared is not None
+    operation, claim = prepared
+    assert operation == "sanitize"
+
+
+def test_load_externalized_payload_requires_string_content(tmp_path):
+    engine = _engine(tmp_path, "sidecar-nonstring-content")
+    try:
+        storage = tmp_path / "sidecar-nonstring-content-externalized"
+        storage.mkdir(parents=True, exist_ok=True)
+        for name, content in (
+            ("truthy-list.json", [1, 2]),
+            ("dict.json", {"a": 1}),
+            ("number.json", 123),
+            ("empty-list.json", []),
+        ):
+            (storage / name).write_text(
+                json.dumps(
+                    {
+                        "kind": "tool_result",
+                        "tool_call_id": "call-nonstring",
+                        "content": content,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            assert engine.load_externalized_payload_sidecar(name) is None, name
+
+        (storage / "no-content.json").write_text(
+            json.dumps({"kind": "tool_result"}),
+            encoding="utf-8",
+        )
+        assert engine.load_externalized_payload_sidecar("no-content.json") is None
+
+        # The summary fallback used by legacy readers must not raise on
+        # non-string content either (e.g. metadata re-reads of malformed files).
+        summary = _externalized_summary(Path("malformed.json"), {"content": [1, 2]})
+        assert summary["content_chars"] is None
+        assert summary["content_bytes"] is None
+
+        (storage / "ok.json").write_text(
+            json.dumps({"kind": "tool_result", "content": "durable text"}),
+            encoding="utf-8",
+        )
+        loaded = engine.load_externalized_payload_sidecar("ok.json")
+        assert loaded is not None
+        assert loaded["content"] == "durable text"
+        assert loaded["content_chars"] == len("durable text")
+    finally:
+        engine.shutdown()
+
+
+def test_stale_auxiliary_session_end_preserves_reused_foreground_claim(tmp_path):
+    class StaleAuxiliaryFrame:
+        def __init__(self, session_id: str):
+            self.session_id = session_id
+            self._subagent_id = session_id
+            self._delegate_depth = 1
+
+        def end(self, engine: LCMEngine, messages) -> None:
+            engine.on_session_end(self.session_id, messages)
+
+    engine = _engine(tmp_path, "claim-stale-aux-reused-end")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-stale-aux-reuse-0000000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=81)
+    pending_claim = engine._pending_sanitation_claim
+
+    stale_frame = StaleAuxiliaryFrame(engine.bound_session_id)
+    stale_frame.end(engine, [{"role": "user", "content": "stale auxiliary tail"}])
+
+    assert (
+        engine._pending_sanitation_claim is pending_claim
+    ), "a stale auxiliary end for a reused foreground id destroyed the fresh claim"
+    sanitized, returned_claim = engine.compress(
+        deepcopy(messages),
+        operation_claim=claim,
+    )
+    assert returned_claim is claim
+    assert engine.last_compression_status == "sanitized"
+    assert "sk-synthetic-stale-aux-reuse" not in _content_text(sanitized)
+
+
+def test_session_end_does_not_block_behind_unclaimed_summarization(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(
+        tmp_path,
+        "session-end-not-behind-summarization",
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+        sensitive_patterns_enabled=False,
+    )
+    engine.threshold_tokens = 1
+    messages = [
+        {"role": "user", "content": "eligible backlog " * 40},
+        {"role": "assistant", "content": "eligible answer"},
+        {"role": "user", "content": "fresh question"},
+    ]
+    summarize_started = threading.Event()
+    release_summarization = threading.Event()
+
+    def gated_summarization(**_kwargs):
+        summarize_started.set()
+        assert release_summarization.wait(10)
+        return ("slow summary", 1)
+
+    monkeypatch.setattr(lcm_engine, "summarize_with_escalation", gated_summarization)
+
+    results = {}
+    compressor = threading.Thread(
+        target=lambda: results.setdefault(
+            "compress",
+            engine.compress(deepcopy(messages), current_tokens=100_000),
+        )
+    )
+    compressor.start()
+    assert summarize_started.wait(5)
+
+    # While unclaimed summarization runs, the claim lock must be free so a
+    # concurrent bound session end can invalidate claims without waiting.
+    lock_free = engine._sanitation_claim_lock.acquire(blocking=False)
+    if lock_free:
+        engine._sanitation_claim_lock.release()
+    assert lock_free, "unclaimed compaction must not hold the claim lock through summarization"
+
+    ender_done = threading.Event()
+    ender = threading.Thread(
+        target=lambda: (
+            engine.on_session_end(engine.bound_session_id, [{"role": "user", "content": "end"}]),
+            ender_done.set(),
+        )
+    )
+    ender.start()
+    ender_completed_during_summarization = ender_done.wait(2.0)
+
+    release_summarization.set()
+    compressor.join(10)
+    ender.join(10)
+
+    assert ender_completed_during_summarization, (
+        "on_session_end must not wait behind unclaimed compaction summarization"
+    )
+    assert not compressor.is_alive()
+    assert not ender.is_alive()
+    assert isinstance(results["compress"], list)
+    assert engine.last_compression_status == "compacted"
+
+
+def test_claimed_sanitation_stays_serialized_with_bound_session_end(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _engine(tmp_path, "claimed-sanitation-serialized")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-claimed-serialize-000000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    claim = _claim_sanitation(engine, messages, generation=91)
+
+    ingest_entered = threading.Event()
+    release_ingest = threading.Event()
+    invalidation_done = threading.Event()
+    session_end_done = threading.Event()
+    real_ingest = engine._ingest_messages
+    real_invalidate = engine._invalidate_sanitation_operation
+    results = {}
+
+    def blocked_ingest(candidate_messages):
+        ingest_entered.set()
+        assert release_ingest.wait(10)
+        return real_ingest(candidate_messages)
+
+    def track_invalidation():
+        real_invalidate()
+        invalidation_done.set()
+
+    monkeypatch.setattr(engine, "_ingest_messages", blocked_ingest)
+    monkeypatch.setattr(engine, "_invalidate_sanitation_operation", track_invalidation)
+    compressor = threading.Thread(
+        target=lambda: results.setdefault(
+            "compress",
+            engine.compress(deepcopy(messages), operation_claim=claim),
+        )
+    )
+    compressor.start()
+    assert ingest_entered.wait(5)
+
+    session_ender = threading.Thread(
+        target=lambda: (
+            engine.on_session_end(engine.bound_session_id, deepcopy(messages)),
+            session_end_done.set(),
+        )
+    )
+    session_ender.start()
+    lifecycle_overtook_claim_execution = invalidation_done.wait(0.2)
+    release_ingest.set()
+    compressor.join(10)
+    session_ender.join(10)
+
+    assert not lifecycle_overtook_claim_execution, (
+        "bound session end must not invalidate while claimed sanitation executes"
+    )
+    assert session_end_done.is_set()
+    assert isinstance(results["compress"], tuple)
+    assert results["compress"][1] is claim
+
+
+def test_tool_call_ingest_is_serialized_with_claimed_compression(tmp_path, monkeypatch):
+    engine = _engine(tmp_path, "tool-call-ingest-claim-race2")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-tool-call-ingest-000000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    later_messages = deepcopy(messages)
+    later_messages.append({"role": "user", "content": "later tool-turn follow-up"})
+    claim = _claim_sanitation(engine, messages, generation=35)
+
+    ingest_entered = threading.Event()
+    release_ingest = threading.Event()
+    real_ingest = engine._ingest_messages
+    gate_used = threading.Semaphore(0)
+    results = {}
+
+    def gated_ingest(candidate_messages):
+        if gate_used.acquire(blocking=False):
+            # Second (compressor-side) call passes through.
+            return real_ingest(candidate_messages)
+        ingest_entered.set()
+        assert release_ingest.wait(10), "tool-call ingest was never released"
+        return real_ingest(candidate_messages)
+
+    monkeypatch.setattr(engine, "_ingest_messages", gated_ingest)
+
+    tool_caller = threading.Thread(
+        target=lambda: results.setdefault(
+            "tool_response",
+            engine.handle_tool_call(
+                "lcm_grep",
+                {"query": "unrelated"},
+                messages=deepcopy(later_messages),
+            ),
+        )
+    )
+    tool_caller.start()
+    assert ingest_entered.wait(5)
+
+    lock_free = engine._sanitation_claim_lock.acquire(blocking=False)
+    if lock_free:
+        engine._sanitation_claim_lock.release()
+    assert not lock_free, "the blocked tool-call ingest must hold the claim lock"
+
+    compressor = threading.Thread(
+        target=lambda: results.setdefault(
+            "compress",
+            engine.compress(deepcopy(messages), operation_claim=claim),
+        )
+    )
+    compressor.start()
+    compressor_still_blocked = not compressor.join(0.5)
+    assert compressor_still_blocked, (
+        "claimed compression must not complete while a tool-call ingest holds the claim lock"
+    )
+
+    release_ingest.set()
+    tool_caller.join(10)
+    compressor.join(10)
+
+    assert not tool_caller.is_alive()
+    assert not compressor.is_alive()
+    assert isinstance(results["tool_response"], str)
+    assert isinstance(results["compress"], list), (
+        "a stale sanitation claim must not be echoed after an intervening tool-call ingest"
+    )

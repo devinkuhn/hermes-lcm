@@ -3257,10 +3257,21 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         )
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        if session_id == self._session_id:
-            self._invalidate_sanitation_operation()
+        # Classify the callback BEFORE invalidating sanitation state. A stale
+        # auxiliary end for an id the foreground has since reused satisfies the
+        # string equality above, but nonzero ended_generation / lineage-suppressed
+        # reuse proves the callback is not the bound foreground ending - and must
+        # not destroy a fresh foreground sanitation claim.
         ended_generation = self._in_process_auxiliary_caller_generation(session_id)
         active_auxiliary_end = session_id in self._active_auxiliary_session_ids()
+        if session_id == self._session_id and not (
+            ended_generation
+            or (
+                session_id != self._thread_context_session_id()
+                and self._auxiliary_lineage_suppressed_as_foreground(session_id)
+            )
+        ):
+            self._invalidate_sanitation_operation()
         if (
             self._has_auxiliary_lineage_session(session_id)
             and session_id != self._session_id
@@ -3812,17 +3823,23 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages = kwargs.get("messages")
 
         if name != "lcm_inspect" and messages and self._session_id:
-            if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
-                self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
-            elif not (
-                self._session_ignored or self._session_stateless or self._thread_context_stateless()
-            ):
-                try:
-                    self._ingest_messages(messages)
-                    self._record_ingest_success()
-                    self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
-                except Exception as e:
-                    self._record_ingest_failure("tool-call ingest", e)
+            # Serialize with claimed compression exactly like ingest(): a
+            # tool-call ingest must not advance _ingest_cursor /
+            # _foreground_ingest_revision underneath a validated sanitation
+            # claim, or a stale claim could be echoed for a message set that
+            # no longer matches active replay.
+            with self._sanitation_claim_lock:
+                if self._maybe_reclassify_current_session_as_auxiliary_before_message_ingest():
+                    self._remember_lcm_bypass_message_prefix(self._bypass_lcm_session_id(), messages)
+                elif not (
+                    self._session_ignored or self._session_stateless or self._thread_context_stateless()
+                ):
+                    try:
+                        self._ingest_messages(messages)
+                        self._record_ingest_success()
+                        self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+                    except Exception as e:
+                        self._record_ingest_failure("tool-call ingest", e)
 
         handlers = {
             "lcm_grep": lcm_tools.lcm_grep,
