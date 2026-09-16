@@ -4627,6 +4627,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._ingest_cursor = self._reconcile_ingest_cursor_from_store(reconcile_messages)
             self._ingest_cursor_needs_reconcile = False
         cursor = min(max(self._ingest_cursor, 0), n)
+        recomputed_replay_messages = replay_messages
         if cursor > 0:
             cached_source_identities = getattr(self, "_last_active_replay_source_identities", None)
             cached_active_replay_messages = getattr(self, "_last_active_replay_messages", None)
@@ -4655,7 +4656,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         original_new_messages = messages[cursor:] if cursor < n else []
 
         if not new_messages:
+            # A replay refresh (persisted-output recovery metadata, sensitive
+            # redaction, quarantine/ignore placeholders) can change the active
+            # replay for ALREADY-INGESTED messages even when nothing new is
+            # stored, so the foreground revision must advance whenever this
+            # no-new-rows pass RECOMPUTES a divergent active replay for the
+            # message identities the remembered replay currently describes:
+            # sanitation claims are keyed on the revision and must not survive
+            # an active-state change, and the identical-prefix replay cache
+            # must not silently keep serving stale state over divergent
+            # recomputed state. Refreshes over other message sets (a
+            # foreign-list session-end flush) reflect no active-state change
+            # and must not consume a claim.
             cached_replay = self._cached_active_replay_messages(messages)
+            remembered_identities = getattr(
+                self,
+                "_last_active_replay_source_identities",
+                None,
+            )
+            replay_changed_active_state = bool(
+                [self._message_replay_identity(message) for message in messages]
+                == remembered_identities
+                and recomputed_replay_messages
+                != (cached_replay if cached_replay is not None else getattr(self, "_last_active_replay_messages", None))
+            )
+            if replay_changed_active_state:
+                self._foreground_ingest_revision += 1
             self._compression_boundary_ingest_pending = False
             self._compression_boundary_active_placeholder_digest_budget = {}
             self._compression_boundary_active_placeholder_digest_ordinals = {}

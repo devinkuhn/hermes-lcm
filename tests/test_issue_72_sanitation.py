@@ -2500,3 +2500,205 @@ def test_tool_call_ingest_is_serialized_with_claimed_compression(tmp_path, monke
     assert isinstance(results["compress"], list), (
         "a stale sanitation claim must not be echoed after an intervening tool-call ingest"
     )
+
+
+def test_threshold_full_sweep_uses_post_sanitation_pressure(tmp_path):
+    """Finding 4028392289: sweep selection must see sanitation-expanded pressure.
+
+    A raw prompt below the threshold whose active replay is EXPANDED by
+    sensitive-redaction sanitation crosses the threshold only after
+    sanitation, so the threshold full sweep must be selected from the
+    post-sanitation token pressure and drain the raw backlog outside the
+    fresh tail.
+    """
+    engine = _engine(tmp_path, "sweep-post-sanitation-pressure", threshold_full_sweep_enabled=True)
+    raw = "password: supersecretvalue123456"
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "backlog alpha"},
+        {"role": "assistant", "content": "reply alpha"},
+        {"role": "user", "content": f"please store {raw} for me"},
+        {"role": "user", "content": "fresh question"},
+    ]
+    raw_tokens = count_messages_tokens(messages)
+    engine.threshold_tokens = raw_tokens + 1
+    replay = engine._ingest_messages(list(messages))
+    assert count_messages_tokens(replay) > engine.threshold_tokens, (
+        "sanitation must expand the replay above the threshold for this scenario"
+    )
+
+    summarized = []
+
+    def fake_leaf(chunk, focus_topic=None, deadline=None):
+        summarized.append([str(m.get("content") or "")[:16] for m in chunk])
+        return chunk, count_messages_tokens(chunk), "sweep summary", 1, 0
+
+    engine._summarize_leaf_chunk_with_rescue = fake_leaf
+    try:
+        compressed = engine.compress(messages, current_tokens=raw_tokens)
+        text = "\n".join(str(m.get("content") or "") for m in compressed)
+        telemetry = engine.get_status()["threshold_full_sweep"]
+        assert summarized, "the sweep must summarize the raw backlog"
+        assert telemetry["status"] != "never_run", telemetry
+        assert telemetry["tokens_before"] >= engine.threshold_tokens
+        assert "backlog alpha" not in text, "raw backlog must leave the active context"
+    finally:
+        engine.shutdown()
+
+
+def test_load_externalized_payload_returns_none_on_non_utf8_sidecar(tmp_path):
+    """Finding 4028392298: non-UTF-8 sidecar bytes degrade to None, never raise."""
+    engine = _engine(tmp_path, "sidecar-non-utf8")
+    try:
+        storage = tmp_path / "sidecar-non-utf8-externalized"
+        storage.mkdir(parents=True, exist_ok=True)
+        (storage / "bad.json").write_bytes(b'\xff\xfe{"kind":"tool_result"}')
+        (storage / "bad-bom-less.json").write_bytes(b'{"a": "\xff\xfe"}')
+        for name in ("bad.json", "bad-bom-less.json"):
+            assert engine.load_externalized_payload_sidecar(name) is None, name
+            from hermes_lcm.externalize import load_externalized_payload
+
+            assert (
+                load_externalized_payload(
+                    name,
+                    config=engine._config,
+                    hermes_home=str(tmp_path / "sidecar-non-utf8-home"),
+                )
+                is None
+            ), name
+
+        # A valid UTF-8 sidecar still loads through the same path.
+        (storage / "ok.json").write_text(
+            json.dumps({"kind": "tool_result", "content": "durable text"}),
+            encoding="utf-8",
+        )
+        loaded = engine.load_externalized_payload_sidecar("ok.json")
+        assert loaded is not None
+        assert loaded["content"] == "durable text"
+    finally:
+        engine.shutdown()
+
+
+def test_replay_identity_distinguishes_absent_content_from_empty_string(tmp_path):
+    """Finding 4028392306: content=None must not collide with content='' in identity.
+
+    The 4-field identity tuple cannot be widened (many call sites unpack
+    exactly 4 fields), so content presence is encoded inside the content
+    component: absent (None) content carries a sentinel prefix, empty-string
+    content stays bare, and a live value that already starts with the
+    sentinel is escaped so the encoding is unambiguous.
+    """
+    from hermes_lcm.reconcile import (
+        _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX,
+        _REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX,
+    )
+
+    engine = _engine(tmp_path, "identity-absent-content")
+    try:
+        absent = engine._message_replay_identity({"role": "user", "content": None})
+        empty = engine._message_replay_identity({"role": "user", "content": ""})
+        assert len(absent) == 4 and len(empty) == 4
+        assert absent != empty, "None and '' must not share a replay identity"
+        assert absent[1].startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX)
+        assert empty[1] == ""
+
+        # The sentinel is injective: a live value starting with it is escaped,
+        # and normal content is never prefixed.
+        live_prefixed = engine._message_replay_identity(
+            {"role": "user", "content": _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX + " tail"}
+        )
+        normal = engine._message_replay_identity({"role": "user", "content": "normal text"})
+        assert live_prefixed[1].startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX)
+        assert not normal[1].startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX)
+
+        # The same encoding applies to durable rows so stored/active matching
+        # keeps a consistent identity for NULL-content rows.
+        stored_absent = engine._message_replay_identity(
+            {"role": "user", "content": None},
+            stored_row=True,
+        )
+        assert stored_absent == absent
+    finally:
+        engine.shutdown()
+
+
+def test_no_new_message_ingest_bumps_revision_only_when_replay_refresh_changes_state(tmp_path, monkeypatch):
+    """Finding 4028392314: no-new-rows replay refreshes advance the ingest revision.
+
+    The revision gates sanitation claims and cached-replay reuse, so a
+    no-new-rows pass whose recomputed active replay diverges from the
+    remembered replay for the same message identities must advance it. A
+    foreign-list session-end flush (different identities, unchanged replay)
+    is bookkeeping and must NOT consume a live claim.
+    """
+    engine = _engine(tmp_path, "no-new-ingest-revision-refresh")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {"role": "user", "content": "api_key=sk-synthetic-fix4-invar-0000000"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=3)
+    assert engine._pending_sanitation_claim[1][6] == 1
+
+    # A replay refresh for the SAME identities diverges from the remembered
+    # replay (here: persisted-output recovery metadata appearing on refresh,
+    # the same class of transformation the persisted-output recovery path
+    # performs). The revision must advance and the stale claim must die.
+    orig_redact = engine._redact_active_replay_messages
+
+    def refreshed_replay(candidate_messages):
+        replay = orig_redact(candidate_messages)
+        replay = [dict(msg) for msg in replay]
+        replay[0] = dict(replay[0])
+        replay[0]["content"] = replay[0]["content"] + (
+            "\n[LCM persisted-output file generation: size=10; mtime_ns=1; ctime_ns=1]"
+        )
+        return replay
+
+    monkeypatch.setattr(engine, "_redact_active_replay_messages", refreshed_replay)
+    engine._ingest_messages(deepcopy(messages))
+    assert engine._foreground_ingest_revision == 2, (
+        "a divergent same-identity replay refresh must advance the foreground ingest revision"
+    )
+    result = engine.compress(deepcopy(messages), operation_claim=claim)
+    assert not (isinstance(result, tuple) and result[1] is claim), (
+        "a sanitation claim must not survive a replay refresh that changed active state"
+    )
+
+    # A foreign-list session-end flush reproduces an unchanged replay over
+    # identities the remembered replay does not describe: no revision bump,
+    # and a fresh claim must still be consumable afterwards.
+    engine = _engine(tmp_path, "no-new-ingest-revision-flush")
+    engine.threshold_tokens = 90_000
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-no-new-flush-000000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    claim = _claim_sanitation(engine, messages, generation=81)
+    pending_claim = engine._pending_sanitation_claim
+
+    class StaleAuxiliaryFrame:
+        def __init__(self, session_id: str):
+            self.session_id = session_id
+            self._subagent_id = session_id
+            self._delegate_depth = 1
+
+        def end(self, bound_engine: LCMEngine, bound_messages) -> None:
+            bound_engine.on_session_end(self.session_id, bound_messages)
+
+    StaleAuxiliaryFrame(engine.bound_session_id).end(
+        engine,
+        [{"role": "user", "content": "stale auxiliary tail"}],
+    )
+    assert engine._pending_sanitation_claim is pending_claim
+    assert engine._foreground_ingest_revision == 1, (
+        "an unchanged foreign-list flush must not advance the foreground ingest revision"
+    )
+    result = engine.compress(deepcopy(messages), operation_claim=claim)
+    assert isinstance(result, tuple) and result[1] is claim
+    assert engine.last_compression_status == "sanitized"

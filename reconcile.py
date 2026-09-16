@@ -49,6 +49,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Content-presence encoding for replay identities: content=None (SQL NULL in
+# durable rows / absent active fields) must not collide with content='' in the
+# 4-field identity tuple, so absence carries an unambiguous sentinel prefix and
+# live values that already start with it are escaped. Both constants are
+# impossible as provider message content because '[' cannot start an escaped
+# form and the sentinel is fixed-length.
+_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX = "[LCM replay identity: content absent]"
+_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX = "[LCM replay identity: content escaped] "
+
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
 
 
@@ -126,7 +135,18 @@ class ReconcileMixin:
 
     def _message_replay_identity(self, msg: Dict[str, Any], *, stored_row: bool = False) -> tuple[str, str, str, str]:
         role = str(msg.get("role") or "unknown")
-        content = normalize_content_value(msg.get("content")) or ""
+        normalized_content = normalize_content_value(msg.get("content"))
+        # Encode content presence (None vs '') inside the existing content
+        # component: callers unpack exactly 4 fields, so absence is marked with
+        # a sentinel prefix instead of widening the identity tuple. Raw
+        # placeholder-marker content is matched through the separate
+        # raw-placeholder identity path, which restores the unprefixed form.
+        if normalized_content is None:
+            content = _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX + ""
+        else:
+            content = normalized_content
+            if content.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX):
+                content = _REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX + content
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)

@@ -912,10 +912,16 @@ class CompactionMixin:
         leaf_compacted_this_turn = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
-        estimated_active_tokens = (
-            observed_prompt_tokens
-            if observed_prompt_tokens is not None and observed_prompt_tokens > 0
-            else count_messages_tokens(messages)
+        raw_input_tokens = count_messages_tokens(messages)
+        post_sanitation_tokens = count_messages_tokens(working_messages)
+        estimated_active_tokens = max(
+            (
+                observed_prompt_tokens
+                if observed_prompt_tokens is not None and observed_prompt_tokens > 0
+                else 0
+            ),
+            raw_input_tokens,
+            post_sanitation_tokens,
         )
         threshold_full_sweep_active = bool(
             self._config.threshold_full_sweep_enabled
