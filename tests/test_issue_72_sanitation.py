@@ -488,7 +488,7 @@ def test_preflight_handoff_without_host_attempt_can_be_claimed_by_first_generati
     assert prepared[0] == "sanitize"
 
 
-def test_preflight_handoff_cannot_be_claimed_by_later_attempt_generation(tmp_path):
+def test_preflight_handoff_cannot_be_claimed_by_much_later_attempt_generation(tmp_path):
     engine = _engine(tmp_path, "stale-preflight-generation")
     messages = [
         {
@@ -499,13 +499,13 @@ def test_preflight_handoff_cannot_be_claimed_by_later_attempt_generation(tmp_pat
     engine._compression_attempt_generation = 40
     assert engine.should_compress_preflight(deepcopy(messages)) is True
 
-    engine._compression_attempt_generation = 41
+    engine._compression_attempt_generation = 42
 
     assert (
         engine.prepare_compression_operation(
             deepcopy(messages),
             session_id=engine.bound_session_id,
-            attempt_generation=41,
+            attempt_generation=42,
         )
         is None
     )
@@ -2702,3 +2702,138 @@ def test_no_new_message_ingest_bumps_revision_only_when_replay_refresh_changes_s
     result = engine.compress(deepcopy(messages), operation_claim=claim)
     assert isinstance(result, tuple) and result[1] is claim
     assert engine.last_compression_status == "sanitized"
+
+
+def test_preflight_handoff_claim_accepted_at_next_attempt_generation(tmp_path):
+    """Contract (i): the host bumps the attempt generation exactly once between
+    should_compress_preflight() and prepare on the SAME attempt, so a handoff
+    recorded at generation G validates when prepare runs at G+1 (or G)."""
+    engine = _engine(tmp_path, "claim-handoff-next-generation")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-handoff-next-generation-00000000",
+        }
+    ]
+    engine._compression_attempt_generation = 40
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+    engine._compression_attempt_generation = 41
+
+    prepared = engine.prepare_compression_operation(
+        deepcopy(messages),
+        session_id=engine.bound_session_id,
+        attempt_generation=41,
+    )
+    assert prepared is not None
+    operation, claim = prepared
+    assert operation == "sanitize"
+    assert claim is not None
+    engine.shutdown()
+
+
+def test_preflight_handoff_rejected_two_attempts_after_record(tmp_path):
+    """Contract (ii): anything beyond handoff[5] + 1 proves a second attempt
+    consumed or replayed the claim — it must be rejected, not silently accepted."""
+    engine = _engine(tmp_path, "claim-handoff-two-generations-late")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-handoff-two-generations-000000",
+        }
+    ]
+    engine._compression_attempt_generation = 40
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+    engine._compression_attempt_generation = 42
+
+    assert (
+        engine.prepare_compression_operation(
+            deepcopy(messages),
+            session_id=engine.bound_session_id,
+            attempt_generation=42,
+        )
+        is None
+    )
+    assert engine._pending_sanitation_claim is None
+    engine.shutdown()
+
+
+def test_new_turn_preflight_overwrites_handoff_and_rejects_old_identity(
+    tmp_path,
+):
+    """Contract (iii): a new turn's preflight replaces the handoff; the old
+    claim identity (stale message payload + stale generation) must not
+    validate against the fresh handoff."""
+    engine = _engine(tmp_path, "claim-handoff-overwrite")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-handoff-overwrite-old-000000000",
+        }
+    ]
+    engine._compression_attempt_generation = 50
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+    prepared = engine.prepare_compression_operation(
+        deepcopy(messages),
+        session_id=engine.bound_session_id,
+        attempt_generation=50,
+    )
+    assert prepared is not None
+    _, old_claim = prepared
+
+    # New turn: different sensitive payload, consumed by a fresh preflight
+    # that records a new handoff identity.
+    new_messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-handoff-overwrite-new-000000000",
+        },
+        {"role": "assistant", "content": "fresh answer"},
+    ]
+    engine._ingest_messages(deepcopy(new_messages))
+    assert engine.should_compress_preflight(deepcopy(new_messages)) is True
+
+    # The stale claim's identity no longer matches the live handoff.
+    result = engine.compress(deepcopy(messages), operation_claim=old_claim)
+    assert isinstance(result, list)
+    engine.shutdown()
+
+
+def test_generation_mismatch_rejection_warns_with_session_identity(
+    tmp_path,
+    caplog,
+):
+    """A genuine attempt-generation mismatch logs one warning carrying the
+    session, handoff generation, passed generation, and current generation."""
+    engine = _engine(tmp_path, "claim-handoff-warn")
+    messages = [
+        {
+            "role": "user",
+            "content": "api_key=sk-synthetic-handoff-warn-0000000000000000",
+        }
+    ]
+    engine._compression_attempt_generation = 40
+    assert engine.should_compress_preflight(deepcopy(messages)) is True
+
+    engine._compression_attempt_generation = 43
+
+    with caplog.at_level(logging.WARNING, logger="hermes_lcm.compaction"):
+        assert (
+            engine.prepare_compression_operation(
+                deepcopy(messages),
+                session_id=engine.bound_session_id,
+                attempt_generation=43,
+            )
+            is None
+        )
+    assert sum(
+        1
+        for record in caplog.records
+        if "attempt-generation mismatch" in record.getMessage()
+    ) == 1
+    assert f"session_id={engine._session_id}" in caplog.text
+    assert "handoff_generation=40" in caplog.text
+    assert "passed_generation=43" in caplog.text
+    assert "current_generation=43" in caplog.text
+    engine.shutdown()

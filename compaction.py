@@ -108,13 +108,34 @@ class CompactionMixin:
                 or session_id != self._session_id
                 or isinstance(attempt_generation, bool)
                 or not isinstance(attempt_generation, int)
+                # The host bumps the engine's attempt generation exactly once
+                # between should_compress_preflight() (which records handoff[5])
+                # and prepare on the SAME attempt, so a claim validates at
+                # handoff[5] or handoff[5] + 1. Anything higher means a second
+                # attempt consumed/replayed the claim — reject.
                 or (
                     handoff[5] is not None
-                    and handoff[5] != attempt_generation
+                    and attempt_generation not in (handoff[5], handoff[5] + 1)
                 )
                 or attempt_generation != current_generation
                 or handoff[6] != getattr(self, "_foreground_ingest_revision", 0)
             ):
+                if (
+                    handoff is not None
+                    and handoff[5] is not None
+                    and isinstance(attempt_generation, int)
+                    and not isinstance(attempt_generation, bool)
+                    and attempt_generation not in (handoff[5], handoff[5] + 1)
+                ):
+                    logger.warning(
+                        "Sanitation claim rejected on attempt-generation mismatch "
+                        "(session_id=%s, handoff_generation=%s, passed_generation=%s, "
+                        "current_generation=%s); compression will run generic",
+                        getattr(self, "_session_id", None),
+                        handoff[5],
+                        attempt_generation,
+                        current_generation,
+                    )
                 return None
             claim = object()
             self._pending_sanitation_claim = (
