@@ -171,6 +171,19 @@ def _strip_replay_identity_shape_tag(content: str) -> str:
         return content[1:]
     return content
 
+
+def _tail_tagless(identities: list[tuple[str, str, str, str]]) -> list[tuple[str, str, str, str]]:
+    """Shape-tag-stripped identity list for content-only comparisons.
+
+    Reconcile paths compare LIVE identities (list/dict-tagged structured
+    content) against STORED identities (string-tagged text); the tag is a
+    live-vs-claim distinction, not part of the row content identity
+    (Bugbot 4041497059)."""
+    return [
+        (role, _strip_replay_identity_shape_tag(content), tool_call_id, tool_calls)
+        for role, content, tool_call_id, tool_calls in identities
+    ]
+
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
 
 
@@ -502,12 +515,23 @@ class ReconcileMixin:
                 transformed_candidate.append(self._persisted_output_durable_wildcard_identity(candidate_identity))
                 transformed_stored.append(self._persisted_output_durable_wildcard_identity(stored_identity))
                 continue
-            transformed_candidate.append(candidate_identity)
-            transformed_stored.append(stored_identity)
+            # Shape-tag agnostic (Bugbot 4041497059): content-identity comparison
+            # across the live/stored boundary must ignore the shape tag.
+            def _tagless1(identity: tuple[str, str, str, str]) -> tuple[str, str, str, str]:
+                return (
+                    identity[0],
+                    _strip_replay_identity_shape_tag(identity[1]),
+                    identity[2],
+                    identity[3],
+                )
+            transformed_candidate.append(_tagless1(candidate_identity))
+            transformed_stored.append(_tagless1(stored_identity))
         return saw_persisted_output and transformed_candidate == transformed_stored
 
     @classmethod
-    def _identity_content_for_active_cleanup(cls, content: str) -> Any:
+    def _identity_content_for_active_cleanup(
+        cls, content: str, content_is_tagged: bool = True
+    ) -> Any:
         """Decode canonical stored JSON content before active-cleanup checks.
 
         Structured assistant content is persisted as deterministic JSON. Active
@@ -516,10 +540,15 @@ class ReconcileMixin:
         a durable assistant row could be absent from sanitized active context.
         The identity's shape tag (round-8 finding 4029411030) is stripped before
         decoding so the tagged content component does not defeat the JSON parse.
+        ``content_is_tagged=False`` (Bugbot 4041497061): the caller already
+        supplies a TAGLESS content component (the store-id map strips tags on
+        both sides); peeling again would eat the first character of assistant
+        content that merely starts with s/l/d/n/o (e.g. "null hypothesis").
         """
         if not isinstance(content, str):
             return content
-        content = _strip_replay_identity_shape_tag(content)
+        if content_is_tagged:
+            content = _strip_replay_identity_shape_tag(content)
         try:
             decoded = json.loads(content)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -532,13 +561,16 @@ class ReconcileMixin:
     def _active_cleanup_replay_identity(
         cls,
         identity: tuple[str, str, str, str],
+        content_is_tagged: bool = True,
     ) -> tuple[str, str, str, str] | None:
         role, content, tool_call_id, tool_calls = identity
         if role != "assistant":
             return identity
         msg: dict[str, Any] = {
             "role": role,
-            "content": cls._identity_content_for_active_cleanup(content),
+            "content": cls._identity_content_for_active_cleanup(
+                content, content_is_tagged=content_is_tagged
+            ),
         }
         if tool_calls:
             try:
@@ -552,9 +584,13 @@ class ReconcileMixin:
         # Re-derive the shape tag from the cleaned value's RAW shape (round-8
         # finding 4029411030): active cleanup preserves list/dict shapes, so
         # the cleaned variant must stay comparable with live identities.
+        # Tagless callers (Bugbot 4041497061) get tagless output back — the
+        # store-id map's comparisons are content-only by design.
         cleaned_content = cleaned.get("content")
-        cleaned_tag = _replay_identity_shape_tag_for_value(cleaned_content)
         cleaned_normalized = normalize_content_value(cleaned_content) or ""
+        if not content_is_tagged:
+            return (role, cleaned_normalized, tool_call_id, tool_calls)
+        cleaned_tag = _replay_identity_shape_tag_for_value(cleaned_content)
         return (
             role,
             cleaned_tag + cleaned_normalized,
@@ -812,14 +848,14 @@ class ReconcileMixin:
                 and len(candidate_prefix) == 1
                 and raw_session_count == 1
                 and bool(extract_externalized_ref(candidate_singleton_original_content))
-                and candidate_prefix == stored_tail
+                and _tail_tagless(candidate_prefix) == _tail_tagless(stored_tail)
             )
             has_persisted_marker_singleton_replay = (
                 matches_raw_tail
                 and not candidate_has_unrecoverable_persisted_marker
                 and len(candidate_prefix) == 1
                 and raw_session_count == 1
-                and candidate_prefix == stored_tail
+                and _tail_tagless(candidate_prefix) == _tail_tagless(stored_tail)
                 and candidate_prefix[0][0] == "tool"
                 and _is_hermes_persisted_output_marker(candidate_singleton_original_content)
             )
@@ -859,7 +895,7 @@ class ReconcileMixin:
                 candidate_has_persisted_marker
                 and not candidate_has_unrecoverable_persisted_marker
                 and matches_raw_tail
-                and candidate_prefix == stored_tail[-len(candidate_prefix) :]
+                and _tail_tagless(candidate_prefix) == _tail_tagless(stored_tail[-len(candidate_prefix) :])
             )
             has_persisted_marker_specific_replay_evidence = (
                 not candidate_has_persisted_marker
@@ -983,11 +1019,20 @@ class ReconcileMixin:
             return False
         if not stored_tail or len(incoming_identities) >= len(stored_tail):
             return False
-        if set(incoming_identities).intersection(stored_tail):
+        # Shape-tag agnostic (Bugbot 4041497059): stored rows are string-tagged
+        # while live structured content is list/dict-tagged; staleness matching
+        # is a CONTENT question, so compare tagless.
+        def _tagless_identities(identities: list[tuple[str, str, str, str]]) -> list[tuple[str, str, str, str]]:
+            return [
+                (role, _strip_replay_identity_shape_tag(content), tool_call_id, tool_calls)
+                for role, content, tool_call_id, tool_calls in identities
+            ]
+        tagless_incoming = _tagless_identities(incoming_identities)
+        if set(tagless_incoming).intersection(_tagless_identities(stored_tail)):
             return False
-        if len(incoming_identities) > len(stored_head):
+        if len(tagless_incoming) > len(stored_head):
             return False
-        return stored_head[: len(incoming_identities)] == incoming_identities
+        return _tagless_identities(stored_head)[: len(tagless_incoming)] == tagless_incoming
 
     def _reconcile_ingest_cursor_from_store(self, messages: List[Dict[str, Any]]) -> int:
         """Infer the in-memory cursor for an existing session after process restart."""
@@ -1191,7 +1236,7 @@ class ReconcileMixin:
         for stored in candidates:
             identity = _tagless(self._message_replay_identity(stored, stored_row=True))
             stored_identities.append(identity)
-            cleanup_identity = self._active_cleanup_replay_identity(identity)
+            cleanup_identity = self._active_cleanup_replay_identity(identity, content_is_tagged=False)
             stored_cleanup_identities.append(cleanup_identity)
             stored_identity_counts[identity] = stored_identity_counts.get(identity, 0) + 1
             if cleanup_identity is not None:
@@ -1218,7 +1263,7 @@ class ReconcileMixin:
             set(),
         )
         for identity, active_count in active_identity_counts.items():
-            wanted_cleanup_identity = self._active_cleanup_replay_identity(identity)
+            wanted_cleanup_identity = self._active_cleanup_replay_identity(identity, content_is_tagged=False)
             stored_exact = stored_identity_counts.get(identity, 0)
             stored_cleanup = 0
             if wanted_cleanup_identity is not None:
@@ -1266,7 +1311,9 @@ class ReconcileMixin:
                     return raw_match_idx
 
             message_identity = _tagless(self._message_replay_identity(msg))
-            wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
+            wanted_cleanup_identity = self._active_cleanup_replay_identity(
+                message_identity, content_is_tagged=False
+            )
             probe_idx = start_idx
             while probe_idx < len(candidates):
                 stored_identity = stored_identities[probe_idx]

@@ -4,6 +4,7 @@ import json
 import os
 
 from hermes_lcm.engine import LCMEngine
+from hermes_lcm.reconcile import _tail_tagless
 
 
 def _engine(tmp_path, name: str, **overrides) -> LCMEngine:
@@ -311,3 +312,39 @@ def test_replay_identity_distinguishes_structured_content_from_json_text(tmp_pat
             assert dict_stored == dict_live
     finally:
         engine.shutdown()
+
+
+def test_store_id_map_cleanup_probe_keeps_first_char_of_taglike_text(tmp_path):
+    """Bugbot 4041497061: the store-id map passes TAGLESS identities into the
+    cleanup probe; the probe must not peel a shape tag again — assistant text
+    like 'null hypothesis' keeps its first character."""
+    engine = _engine(tmp_path, "cleanup-tagless")
+    identity = engine._message_replay_identity(
+        {"role": "assistant", "content": "null hypothesis"}
+    )
+    tagless = identity[1][1:]  # strip the tag like the map does
+    cleaned = engine._active_cleanup_replay_identity(
+        (identity[0], tagless, identity[2], identity[3]),
+        content_is_tagged=False,
+    )
+    assert cleaned is not None
+    assert cleaned[1] == "null hypothesis"
+
+
+def test_stale_snapshot_detection_is_shape_tag_agnostic(tmp_path):
+    """Bugbot 4041497059: staleness matching compares tagless identities —
+    a live structured message must be detected as stale-overlap with its
+    stored string-tagged row."""
+    engine = _engine(tmp_path, "stale-tagless")
+    engine.ingest([{"role": "user", "content": ["hello"]}])
+    stored_row = next(
+        row
+        for row in engine._store.get_session_messages(engine._session_id)
+        if row.get("role") == "user"
+    )
+    stored_identity = engine._message_replay_identity(stored_row, stored_row=True)
+    live_identity = engine._message_replay_identity(
+        {"role": "user", "content": ["hello"]}
+    )
+    assert stored_identity != live_identity  # tags differ
+    assert _tail_tagless([stored_identity]) == _tail_tagless([live_identity])
