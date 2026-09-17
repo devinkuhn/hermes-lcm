@@ -846,11 +846,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             current_store_home = str(getattr(getattr(self, "_store", None), "_hermes_home", "") or "")
             if current_home == str(hermes_home) and current_store_home == str(hermes_home):
                 return False
-            self._hermes_home = hermes_home
-            store = getattr(self, "_store", None)
-            if store is not None:
-                store._hermes_home = hermes_home
-            self._reset_profile_runtime_state()
+            # Serialize the configured-database swap too (round-3 finding
+            # 4041846904): the mutation below is the same half-swap hazard — a
+            # claimed sanitation running concurrently must not read the NEW
+            # profile home under the OLD session id mid-swap.
+            with self._sanitation_claim_lock:
+                self._hermes_home = hermes_home
+                store = getattr(self, "_store", None)
+                if store is not None:
+                    store._hermes_home = hermes_home
+                self._reset_profile_runtime_state()
             logger.info("LCM rebound Hermes home for configured database path %s", hermes_home)
             return True
 
@@ -4693,6 +4698,13 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self._compression_boundary_active_placeholder_digest_ordinals = {}
             self._compression_boundary_stored_placeholder_digest_counts = {}
             self._clear_foreground_rebind_candidate_if_bound_session_confirmed()
+            if replay_changed_active_state:
+                # Round-3 finding 4041846907: a refresh was DETECTED (the
+                # recomputed replay differs for the same source identities) —
+                # returning the stale cached replay here would keep serving the
+                # old active state and re-bump the revision every ingest.
+                # Remember + return the recomputed view.
+                return self._remember_active_replay_messages(messages, replay_messages)
             if cached_replay is not None:
                 return cached_replay
             return self._remember_active_replay_messages(messages, replay_messages)

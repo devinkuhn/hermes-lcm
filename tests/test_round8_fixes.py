@@ -412,3 +412,41 @@ def test_claimed_sanitation_releases_lock_on_fallback(tmp_path):
     # acquired=True at every probe means the lock was FREE during the fallback
     # rerun (probe acquires non-blocking and releases immediately).
     assert all(lock_during_fallback), "claim lock held during generic fallback compaction"
+
+
+def test_cleanup_decodes_absent_sentinel_to_none(tmp_path):
+    """Round-3 finding 4041846913: a stored assistant row with NULL content
+    (tool-call shape) carries the absent sentinel; the cleanup probe must
+    translate it back to None, not treat it as nonempty text."""
+    engine = _engine(tmp_path, "absent-cleanup")
+    identity = engine._message_replay_identity(
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+        stored_row=True,
+    )
+    cleaned = engine._active_cleanup_replay_identity(identity)
+    assert cleaned is not None
+    # The sentinel must NOT survive as literal text in the cleaned content.
+    assert "[LCM replay identity: content absent]" not in cleaned[1]
+
+
+def test_sidecar_restored_content_is_re_escaped(tmp_path):
+    """Round-3 finding 4041846916: content restored from a sidecar whose text
+    begins with a reserved prefix must carry the counted escape encoding, or
+    live and stored identities diverge."""
+    from hermes_lcm.reconcile import (
+        _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX,
+        _escape_replay_identity_content,
+        _count_leading_reserved_prefixes,
+    )
+    engine = _engine(tmp_path, "sidecar-escape")
+    raw = _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX + " payload tail"
+    # The escaped live identity encoding:
+    expected = _escape_replay_identity_content(raw)
+    assert expected.startswith("[LCM replay identity: content escaped] x1 ")
+    # The identity fn applied to a payload-restored content string must produce
+    # the same encoding (simulated by computing the identity of a message whose
+    # content IS the restored raw string):
+    identity = engine._message_replay_identity(
+        {"role": "assistant", "content": raw}
+    )
+    assert identity[1][1:] == expected  # tag prefix + escaped encoding

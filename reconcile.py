@@ -407,6 +407,22 @@ class ReconcileMixin:
             )
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
+        # Reserved-prefix re-escape (round-3 finding 4041846916): content
+        # restored from sidecars/durable payloads above replaced the initially
+        # encoded form; if the restored text begins with a reserved identity
+        # prefix it must carry the counted escape encoding like any other
+        # identity content, or live and stored identities diverge and the row
+        # duplicates on restart.
+        if (
+            isinstance(content, str)
+            and content
+            and not content.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX)
+        ):
+            leading = _count_leading_reserved_prefixes(content)
+            if leading > 0 and not content.startswith(
+                _REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX
+            ):
+                content = _escape_replay_identity_content(content)
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
         # Shape tag (round-8 finding 4029411030): only the LIVE side tags the
         # RAW value shape — that is where structured-vs-string distinction is
@@ -558,6 +574,13 @@ class ReconcileMixin:
             return content
         if content_is_tagged:
             content = _strip_replay_identity_shape_tag(content)
+        # Absent-content sentinel (round-3 finding 4041846913): a stored row
+        # with SQL-NULL content (the common assistant tool-call shape) carries
+        # the sentinel as its identity content; assistant cleanup must see
+        # content=None, not a nonempty sentinel string, or the cleaned durable
+        # tail stops matching the active replay after restart.
+        if content == _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX:
+            return None
         try:
             decoded = json.loads(content)
         except (TypeError, ValueError, json.JSONDecodeError):
