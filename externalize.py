@@ -966,21 +966,22 @@ def load_externalized_payload(ref: str, *, config, hermes_home: str = "") -> Dic
     storage_dir = get_large_output_storage_dir(config, hermes_home=hermes_home, create=False)
     if not storage_dir.exists() or not storage_dir.is_dir():
         return None
-    path = storage_dir / ref
-    if not path.exists() or not path.is_file():
+    # Route through the descriptor-validated open (O_NOFOLLOW + pre/post-open
+    # stat identity + containment to the payload store): a symlinked basename
+    # inside the payload dir must not surface another file's content.
+    decoded = _read_legacy_externalized_payload_json(
+        storage_dir / ref,
+        storage_dir=storage_dir,
+    )
+    if decoded is None:
         return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
+    payload = decoded
     # The public safe reader must never surface a payload whose content the
     # callers treat as text: malformed legacy files degrade to None instead
     # of raising or returning non-string content.
     if not isinstance(payload.get("content"), str):
         return None
-    summary = _externalized_summary(path, payload)
+    summary = _externalized_summary(Path(ref), payload)
     summary["content"] = payload.get("content", "")
     return summary
 

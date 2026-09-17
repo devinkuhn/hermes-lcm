@@ -859,10 +859,16 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         if current_db == db_path and str(self._hermes_home or "") == str(hermes_home):
             return False
 
-        self._close_storage()
-        self._hermes_home = hermes_home
-        self._bind_storage(db_path, hermes_home)
-        self._reset_profile_runtime_state()
+        # Serialize the ENTIRE swap with claimed sanitation (round-8 finding):
+        # closing the old store before the claim lock was acquired let a claimed
+        # sanitation resume against a half-swapped engine (closed helpers) or the
+        # NEW profile's store (foreground messages written into the wrong
+        # profile). Claimed compressions and ingests take this same lock.
+        with self._sanitation_claim_lock:
+            self._close_storage()
+            self._hermes_home = hermes_home
+            self._bind_storage(db_path, hermes_home)
+            self._reset_profile_runtime_state()
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
 

@@ -58,6 +58,119 @@ logger = logging.getLogger(__name__)
 _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX = "[LCM replay identity: content absent]"
 _REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX = "[LCM replay identity: content escaped] "
 
+
+def _count_leading_reserved_prefixes(content: str) -> int:
+    """How many reserved prefixes the string starts with, consuming greedily.
+
+    The escape prefix "wins" when the string starts with it (it is longer and
+    its own reserved namespace), so an escaped string's marker is consumed as
+    one prefix before its remainder is probed.
+    """
+    count = 0
+    probe = content
+    while True:
+        if probe.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX):
+            probe = probe[len(_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX):]
+        elif probe.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX):
+            probe = probe[len(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX):]
+        else:
+            return count
+        count += 1
+
+
+def _escape_replay_identity_content(normalized_content: str) -> str:
+    """Injective encoding for the identity's content component.
+
+    Unprefixed content passes through unchanged. Content starting with either
+    reserved prefix carries an explicit count of the consumed leading prefixes
+    plus the original string verbatim; the counted marker namespace ("[LCM
+    replay identity: content escaped] x<count> ") is unreachable by uncounted
+    strings because the marker itself starts with a reserved prefix and would
+    therefore have been counted. Injectivity proof sketch: two encodings equal
+    implies both unprefixed (then the strings are equal) or both counted (the
+    count field matches, then the verbatim originals match).
+    """
+    count = _count_leading_reserved_prefixes(normalized_content)
+    if count == 0:
+        return normalized_content
+    return (
+        f"{_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX}x{count} "
+        + normalized_content
+    )
+
+
+# One-character content-shape tags (round-8 finding 4029411030). The identity's
+# content component is prefixed with the shape of the ORIGINAL value so
+# structured list/dict content and its JSON-text serialization stop sharing an
+# identity — the sanitation handoff digest (compaction.py) flows from this
+# component and inherits the distinction. The tag composes with the escape
+# machinery (tag first, then the injective escape encoding), and the pair
+# (tag, escaped content) stays injective because the tag is one fixed-alphabet
+# character.
+_REPLAY_IDENTITY_SHAPE_TAG_STRING = "s"
+_REPLAY_IDENTITY_SHAPE_TAG_LIST = "l"
+_REPLAY_IDENTITY_SHAPE_TAG_DICT = "d"
+_REPLAY_IDENTITY_SHAPE_TAG_NULL = "n"
+_REPLAY_IDENTITY_SHAPE_TAG_OTHER = "o"
+_REPLAY_IDENTITY_SHAPE_TAGS = frozenset("sldno")
+
+
+def _replay_identity_shape_tag_for_value(content: Any) -> str:
+    """Shape tag for a LIVE (raw) message content value."""
+    if content is None:
+        return _REPLAY_IDENTITY_SHAPE_TAG_NULL
+    if isinstance(content, str):
+        return _REPLAY_IDENTITY_SHAPE_TAG_STRING
+    if isinstance(content, list):
+        return _REPLAY_IDENTITY_SHAPE_TAG_LIST
+    if isinstance(content, dict):
+        return _REPLAY_IDENTITY_SHAPE_TAG_DICT
+    return _REPLAY_IDENTITY_SHAPE_TAG_OTHER
+
+
+def _replay_identity_shape_tag_for_stored_text(normalized_content: str) -> str:
+    """Shape tag for a STORED row's canonical text content.
+
+    Storage canonicalizes structured content to JSON text (``normalize_content_value``
+    in the store write path), so a stored row cannot carry the original shape.
+    The stored side derives the tag by EXACT round-trip decode: text that parses
+    as list/dict and re-serializes byte-identically is tagged structured — the
+    same convention as ``_identity_content_for_active_cleanup`` — so a row
+    written from a structured live value keeps that value's identity across the
+    round trip. RESIDUAL LIMITATION (unavoidable, information-theoretic): a live
+    STRING whose text is exactly the canonical JSON of a list/dict is stored
+    byte-identically to the structured form, so its stored row carries the
+    structured tag while the live value carried the string tag; such rows are
+    not exact-matchable against their live replay after a restart (they still
+    match through the escaped/active-cleanup fallback views where applicable).
+    """
+    if not normalized_content:
+        return _REPLAY_IDENTITY_SHAPE_TAG_STRING
+    probe = normalized_content.lstrip()
+    first = probe[:1]
+    if first not in "[{":
+        return _REPLAY_IDENTITY_SHAPE_TAG_STRING
+    try:
+        decoded = json.loads(probe)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return _REPLAY_IDENTITY_SHAPE_TAG_STRING
+    if isinstance(decoded, list):
+        expected_tag = _REPLAY_IDENTITY_SHAPE_TAG_LIST
+    elif isinstance(decoded, dict):
+        expected_tag = _REPLAY_IDENTITY_SHAPE_TAG_DICT
+    else:
+        return _REPLAY_IDENTITY_SHAPE_TAG_STRING
+    if normalize_content_value(decoded) == normalized_content:
+        return expected_tag
+    return _REPLAY_IDENTITY_SHAPE_TAG_STRING
+
+
+def _strip_replay_identity_shape_tag(content: str) -> str:
+    """Remove the shape tag from an identity content component (if present)."""
+    if content and content[:1] in _REPLAY_IDENTITY_SHAPE_TAGS:
+        return content[1:]
+    return content
+
 _PRESERVED_OBJECTIVE_CONTEXT_PREFIX = "[Current user objective preserved from compacted history]"
 
 
@@ -141,12 +254,30 @@ class ReconcileMixin:
         # a sentinel prefix instead of widening the identity tuple. Raw
         # placeholder-marker content is matched through the separate
         # raw-placeholder identity path, which restores the unprefixed form.
+        # Content-presence AND prefix-namespace encoding (round-8 findings
+        # 4029411030/1037). Absence is marked with the sentinel prefix. A live
+        # value starting with either reserved prefix is escaped with a COUNTED
+        # marker — the number of leading reserved prefixes is embedded
+        # ("[LCM replay identity: content escaped] xN " + the original string
+        # verbatim) — instead of one blind re-escape prepend: a naive
+        # while-startswith loop never terminates (its own output still starts
+        # with the escape prefix) and a single prepend leaves the
+        # escape-prefixed namespace collidable (a provider string that merely
+        # begins with the escape prefix passed through unchanged and collided
+        # with escaped absent-prefixed content). The counted form is injective:
+        # the marker (with its explicit count) is impossible as an unescaped
+        # provider string's identity because any string starting with the
+        # marker's own prefix is itself counted, and equal encodings imply
+        # equal count + equal original.
+        # The persisted-output marker branch below matches and rewrites the
+        # UNTAGGED encoded content (marker text never starts with a shape tag
+        # character in a reserved namespace, but the marker matchers expect the
+        # bare encoded form); the shape tag is applied to the FINAL component
+        # value at the end of this method.
         if normalized_content is None:
             content = _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX + ""
         else:
-            content = normalized_content
-            if content.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX):
-                content = _REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX + content
+            content = _escape_replay_identity_content(normalized_content)
         if (
             role == "tool"
             and _is_hermes_persisted_output_marker(content)
@@ -255,9 +386,28 @@ class ReconcileMixin:
             if payload is not None and isinstance(payload.get("content"), str):
                 content = payload["content"]
         tool_calls_identity = self._stable_tool_calls_identity(tool_calls)
+        # Shape tag (round-8 finding 4029411030): only the LIVE side tags the
+        # RAW value shape — that is where structured-vs-string distinction is
+        # knowable, and the handoff digest (both endpoints live) needs it. The
+        # stored side tags text as STRING unconditionally (NULL keeps the
+        # absent tag): a stored row cannot know whether its canonical JSON text
+        # was written from a structured value or from a live string whose text
+        # happens to be canonical JSON, and guessing breaks the engine contract
+        # that a re-ingested literal-JSON-string content dedupes against itself
+        # (TestAssemblyToolPairGuardrail rebind tests). Residual asymmetry: a
+        # live list's stored row replays with the string tag after restart —
+        # the pre-existing restart-duplication behavior, unchanged by the tag.
+        if stored_row:
+            shape_tag = (
+                _REPLAY_IDENTITY_SHAPE_TAG_NULL
+                if normalized_content is None
+                else _REPLAY_IDENTITY_SHAPE_TAG_STRING
+            )
+        else:
+            shape_tag = _replay_identity_shape_tag_for_value(msg.get("content"))
         return (
             role,
-            content,
+            shape_tag + content,
             str(msg.get("tool_call_id") or ""),
             tool_calls_identity,
         )
@@ -355,9 +505,12 @@ class ReconcileMixin:
         replay cleanup sees the original list/dict shape, so restart
         reconciliation has to decode the stored identity before deciding whether
         a durable assistant row could be absent from sanitized active context.
+        The identity's shape tag (round-8 finding 4029411030) is stripped before
+        decoding so the tagged content component does not defeat the JSON parse.
         """
         if not isinstance(content, str):
             return content
+        content = _strip_replay_identity_shape_tag(content)
         try:
             decoded = json.loads(content)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -387,9 +540,15 @@ class ReconcileMixin:
         cleaned = _clean_active_assistant_message(msg)
         if cleaned is None:
             return None
+        # Re-derive the shape tag from the cleaned value's RAW shape (round-8
+        # finding 4029411030): active cleanup preserves list/dict shapes, so
+        # the cleaned variant must stay comparable with live identities.
+        cleaned_content = cleaned.get("content")
+        cleaned_tag = _replay_identity_shape_tag_for_value(cleaned_content)
+        cleaned_normalized = normalize_content_value(cleaned_content) or ""
         return (
             role,
-            normalize_content_value(cleaned.get("content")) or "",
+            cleaned_tag + cleaned_normalized,
             tool_call_id,
             tool_calls,
         )
@@ -399,7 +558,7 @@ class ReconcileMixin:
         role, content, _tool_call_id, _tool_calls = identity
         if role != "assistant":
             return False
-        text = str(content or "").strip()
+        text = str(_strip_replay_identity_shape_tag(content) or "").strip()
         return bool(
             re.fullmatch(
                 r"\[Externalized LCM ingest payload: assistant output quarantined; "
@@ -460,7 +619,7 @@ class ReconcileMixin:
                     decoded_tool_calls = []
                 boundary_messages.append({
                     "role": role,
-                    "content": content,
+                    "content": _strip_replay_identity_shape_tag(content),
                     "tool_call_id": tool_call_id,
                     "tool_calls": decoded_tool_calls,
                 })
@@ -994,9 +1153,12 @@ class ReconcileMixin:
                 break
             candidates.extend(page)
             next_candidate_after = page[-1]["store_id"]
+        def _tagless(identity: tuple[Any, ...]) -> tuple[Any, ...]:
+            return (identity[0], _strip_replay_identity_shape_tag(identity[1]), identity[2], identity[3])
+
         active_identity_counts: dict[tuple[Any, ...], int] = {}
         for msg in messages:
-            identity = self._message_replay_identity(msg)
+            identity = _tagless(self._message_replay_identity(msg))
             active_identity_counts[identity] = active_identity_counts.get(identity, 0) + 1
         stored_identity_counts: dict[tuple[Any, ...], int] = {}
         stored_cleanup_identity_counts: dict[tuple[Any, ...], int] = {}
@@ -1009,10 +1171,16 @@ class ReconcileMixin:
         # the O(candidates^2) recomputes removes repeated disk reads on
         # tool-output-heavy histories. Raw-placeholder identities stay lazy (see
         # the memo below) since most rows never need them.
+        # The store-id map matches rows to messages by CONTENT identity; the
+        # shape tag is a live-vs-claim distinction (handoff digest), not a row
+        # identity, and a stored row's tag (string for text) can differ from
+        # the live message's tag (list for structured content). Strip the tag
+        # on both sides WITHIN THIS MAP ONLY so structured content still maps
+        # to its row; claim/digest paths keep the tagged identity.
         stored_identities: list[tuple[Any, ...]] = []
         stored_cleanup_identities: list[Optional[tuple[Any, ...]]] = []
         for stored in candidates:
-            identity = self._message_replay_identity(stored, stored_row=True)
+            identity = _tagless(self._message_replay_identity(stored, stored_row=True))
             stored_identities.append(identity)
             cleanup_identity = self._active_cleanup_replay_identity(identity)
             stored_cleanup_identities.append(cleanup_identity)
@@ -1054,7 +1222,7 @@ class ReconcileMixin:
                         break
                     if id(msg) not in generated_placeholder_message_ids:
                         continue
-                    if self._message_replay_identity(msg) != identity:
+                    if _tagless(self._message_replay_identity(msg)) != identity:
                         continue
                     generated_surplus_skip_message_ids.add(id(msg))
                     surplus_count -= 1
@@ -1088,7 +1256,7 @@ class ReconcileMixin:
                 if raw_match_idx is not None:
                     return raw_match_idx
 
-            message_identity = self._message_replay_identity(msg)
+            message_identity = _tagless(self._message_replay_identity(msg))
             wanted_cleanup_identity = self._active_cleanup_replay_identity(message_identity)
             probe_idx = start_idx
             while probe_idx < len(candidates):
@@ -1123,7 +1291,7 @@ class ReconcileMixin:
                         matched_message_ids.add(id(remaining_msg))
                         probe_idx = raw_match_idx + 1
                         continue
-                message_identity = self._message_replay_identity(remaining_msg)
+                message_identity = _tagless(self._message_replay_identity(remaining_msg))
                 if id(remaining_msg) in generated_surplus_skip_message_ids:
                     continue
                 surplus = local_surplus_skips.get(message_identity, 0)
@@ -1178,7 +1346,7 @@ class ReconcileMixin:
                         probe_idx -= 1
                 if id(msg) in ids_by_message_id:
                     continue
-            message_identity = self._message_replay_identity(msg)
+            message_identity = _tagless(self._message_replay_identity(msg))
             if id(msg) in generated_surplus_skip_message_ids:
                 continue
             surplus = active_surplus_skips.get(message_identity, 0)

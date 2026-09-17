@@ -2591,6 +2591,7 @@ def test_replay_identity_distinguishes_absent_content_from_empty_string(tmp_path
     from hermes_lcm.reconcile import (
         _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX,
         _REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX,
+        _strip_replay_identity_shape_tag,
     )
 
     engine = _engine(tmp_path, "identity-absent-content")
@@ -2599,8 +2600,10 @@ def test_replay_identity_distinguishes_absent_content_from_empty_string(tmp_path
         empty = engine._message_replay_identity({"role": "user", "content": ""})
         assert len(absent) == 4 and len(empty) == 4
         assert absent != empty, "None and '' must not share a replay identity"
-        assert absent[1].startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX)
-        assert empty[1] == ""
+        assert _strip_replay_identity_shape_tag(absent[1]).startswith(
+            _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX
+        )
+        assert _strip_replay_identity_shape_tag(empty[1]) == ""
 
         # The sentinel is injective: a live value starting with it is escaped,
         # and normal content is never prefixed.
@@ -2608,8 +2611,12 @@ def test_replay_identity_distinguishes_absent_content_from_empty_string(tmp_path
             {"role": "user", "content": _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX + " tail"}
         )
         normal = engine._message_replay_identity({"role": "user", "content": "normal text"})
-        assert live_prefixed[1].startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX)
-        assert not normal[1].startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX)
+        assert _strip_replay_identity_shape_tag(live_prefixed[1]).startswith(
+            _REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX
+        )
+        assert not _strip_replay_identity_shape_tag(normal[1]).startswith(
+            _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX
+        )
 
         # The same encoding applies to durable rows so stored/active matching
         # keeps a consistent identity for NULL-content rows.
