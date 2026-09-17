@@ -689,7 +689,6 @@ class CompactionMixin:
         concurrent ``on_session_end`` can invalidate claims without waiting
         through summarization.
         """
-        fallback_to_generic = False
         with self._sanitation_claim_lock:
             pending_claim = self._pending_sanitation_claim
             compatibility_handoff = getattr(
@@ -760,10 +759,10 @@ class CompactionMixin:
                 except _SanitationFallbackNeeded:
                     # Round-3 finding 4041509641: the cleanup-only path does not
                     # apply (threshold/critical pressure reached or handoff
-                    # drifted). Release the claim lock (leaving the with-block
-                    # below) and run the generic compaction OUTSIDE it --
+                    # drifted). Leaving this with-block releases the claim lock;
+                    # the generic compaction below runs outside it --
                     # model-backed summarization must never hold the claim lock.
-                    fallback_to_generic = True
+                    pass
                 except BaseException:
                     self._last_compression_status = "error"
                     self._last_compression_noop_reason = ""

@@ -369,7 +369,6 @@ def test_prefix_count_scan_is_not_quadratic():
 def test_claimed_sanitation_releases_lock_on_fallback(tmp_path):
     """Round-3 finding 4041509641: when the cleanup-only path does not apply,
     the claim lock must be released before model-backed compaction runs."""
-    import threading as _threading
     from hermes_lcm.compaction import _SanitationFallbackNeeded
     from hermes_lcm.config import LCMConfig
 
