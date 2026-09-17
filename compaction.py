@@ -32,6 +32,15 @@ _THRESHOLD_FULL_SWEEP_MAX_PASSES = 12
 _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
+class _SanitationFallbackNeeded(Exception):
+    """Raised inside a claimed-sanitation compress call when the cleanup-only
+    path does not apply (threshold/critical pressure reached or the handoff no
+    longer matches): the caller must RELEASE _sanitation_claim_lock and run the
+    generic compaction outside it. Model-backed summarization under the claim
+    lock blocks session end/ingest/rebind for the full sweep budget
+    (round-3 finding 4041509641)."""
+
+
 def _update_cleanup_handoff_digest(digest: Any, value: str) -> None:
     digest.update(f"{len(value)}:".encode("ascii"))
     for offset in range(0, len(value), 65_536):
@@ -680,6 +689,7 @@ class CompactionMixin:
         concurrent ``on_session_end`` can invalidate claims without waiting
         through summarization.
         """
+        fallback_to_generic = False
         with self._sanitation_claim_lock:
             pending_claim = self._pending_sanitation_claim
             compatibility_handoff = getattr(
@@ -747,16 +757,26 @@ class CompactionMixin:
                         claimed_sanitation=True,
                         claimed_sanitation_handoff=sanitation_handoff,
                     )
+                except _SanitationFallbackNeeded:
+                    # Round-3 finding 4041509641: the cleanup-only path does not
+                    # apply (threshold/critical pressure reached or handoff
+                    # drifted). Release the claim lock (leaving the with-block
+                    # below) and run the generic compaction OUTSIDE it --
+                    # model-backed summarization must never hold the claim lock.
+                    fallback_to_generic = True
                 except BaseException:
                     self._last_compression_status = "error"
                     self._last_compression_noop_reason = ""
                     raise
-                if (
-                    host_claimed_sanitation
-                    and getattr(self, "_last_preflight_cleanup_only_executed", False)
-                ):
-                    return result, operation_claim
-                return result
+                else:
+                    if (
+                        host_claimed_sanitation
+                        and getattr(self, "_last_preflight_cleanup_only_executed", False)
+                    ):
+                        return result, operation_claim
+                    return result
+        # Generic compaction runs OUTSIDE the claim lock: on the fallback path
+        # above the with-block has exited and the lock is released.
         try:
             return self._compress_impl(
                 messages,
@@ -928,6 +948,17 @@ class CompactionMixin:
                 )
             )
             return sanitized_messages
+        if claimed_sanitation:
+            # Claimed sanitation must NEVER fall through to model-backed
+            # compaction while the claim lock is held (round-3 finding
+            # 4041509641): the fallback runs summarization for up to the full
+            # sweep budget under _sanitation_claim_lock, blocking session end,
+            # ingest, and storage rebind. Bail out to the caller, which
+            # releases the lock and re-runs the generic path outside it.
+            raise _SanitationFallbackNeeded(
+                "claimed sanitation cleanup-only path not applicable; "
+                "fallback to generic compaction required"
+            )
         anchor_source_messages = list(working_messages)
         pressure_messages = messages if len(messages) == len(working_messages) else working_messages
         leaf_compacted_this_turn = False

@@ -67,15 +67,24 @@ def _count_leading_reserved_prefixes(content: str) -> int:
     one prefix before its remainder is probed.
     """
     count = 0
-    probe = content
+    # Offset-based scan (round-3 finding 4041509636): each slice assignment
+    # copies the remaining string, making N leading prefixes quadratic in the
+    # payload size; startswith(prefix, pos) scans in place — O(total prefix
+    # bytes) instead of O(N * payload).
+    pos = 0
+    escape_len = len(_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX)
+    absent_len = len(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX)
+    size = len(content)
     while True:
-        if probe.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX):
-            probe = probe[len(_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX):]
-        elif probe.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX):
-            probe = probe[len(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX):]
+        if content.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_ESCAPE_PREFIX, pos):
+            pos += escape_len
+        elif content.startswith(_REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX, pos):
+            pos += absent_len
         else:
             return count
         count += 1
+        if pos >= size:
+            return count
 
 
 def _escape_replay_identity_content(normalized_content: str) -> str:

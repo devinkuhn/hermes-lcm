@@ -348,3 +348,68 @@ def test_stale_snapshot_detection_is_shape_tag_agnostic(tmp_path):
     )
     assert stored_identity != live_identity  # tags differ
     assert _tail_tagless([stored_identity]) == _tail_tagless([live_identity])
+
+
+def test_prefix_count_scan_is_not_quadratic():
+    """Round-3 finding 4041509636: counting N leading reserved prefixes must be
+    linear in the prefix bytes, not quadratic in the payload."""
+    import time as _time
+    from hermes_lcm.reconcile import (
+        _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX,
+        _count_leading_reserved_prefixes,
+    )
+    payload = _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX * 2000
+    start = _time.monotonic()
+    count = _count_leading_reserved_prefixes(payload)
+    elapsed = _time.monotonic() - start
+    assert count == 2000
+    assert elapsed < 0.5, f"prefix scan took {elapsed:.3f}s for 2000 prefixes"
+
+
+def test_claimed_sanitation_releases_lock_on_fallback(tmp_path):
+    """Round-3 finding 4041509641: when the cleanup-only path does not apply,
+    the claim lock must be released before model-backed compaction runs."""
+    import threading as _threading
+    from hermes_lcm.compaction import _SanitationFallbackNeeded
+    from hermes_lcm.config import LCMConfig
+
+    config = LCMConfig(
+        database_path=str(tmp_path / "fb.db"),
+        large_output_externalization_path=str(tmp_path / "fb-ext"),
+        fresh_tail_count=1,
+        leaf_chunk_tokens=1,
+        context_threshold=0.5,
+    )
+    engine = LCMEngine(config=config, hermes_home=str(tmp_path / "fb-home"))
+    engine.on_session_start("fb-session", platform="synthetic",
+                            conversation_id="fb-conversation", context_length=100_000)
+
+    lock_during_fallback = []
+    original_impl = engine._compress_impl
+
+    def spying_impl(*args, **kwargs):
+        if not kwargs.get("claimed_sanitation"):
+            acquired = engine._sanitation_claim_lock.acquire(blocking=False)
+            if acquired:
+                engine._sanitation_claim_lock.release()
+            lock_during_fallback.append(acquired)
+        return original_impl(*args, **kwargs)
+
+    engine._compress_impl = spying_impl
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "filler " * 500},
+        {"role": "assistant", "content": "filler reply " * 500},
+        {"role": "user", "content": "trigger threshold"},
+    ]
+    # Drive compress through the claimed path; the impl raises fallback when the
+    # cleanup-only conditions fail; the generic rerun must happen unlocked.
+    try:
+        result = engine.compress(messages, current_tokens=90_000)
+    except _SanitationFallbackNeeded:
+        raise AssertionError("fallback must be handled inside compress(), not leak")
+    assert result is not None
+    assert lock_during_fallback, "generic fallback rerun was not observed"
+    # acquired=True at every probe means the lock was FREE during the fallback
+    # rerun (probe acquires non-blocking and releases immediately).
+    assert all(lock_during_fallback), "claim lock held during generic fallback compaction"
