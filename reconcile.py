@@ -421,7 +421,16 @@ class ReconcileMixin:
             return True
         if len(candidate_prefix) > len(stored_tail):
             return False
-        return stored_tail[-len(candidate_prefix) :] == candidate_prefix
+        # Shape-tag agnostic (round-8 4029411030 follow-up): a stored row's tag
+        # (string for text) can differ from the live message's tag (list for
+        # structured content); reconciliation matches by CONTENT, so compare
+        # with the tag stripped on both sides.
+        def _tagless(identities: list[tuple[str, str, str, str]]) -> list[tuple[str, str, str, str]]:
+            return [
+                (role, _strip_replay_identity_shape_tag(content), tool_call_id, tool_calls)
+                for role, content, tool_call_id, tool_calls in identities
+            ]
+        return _tagless(stored_tail[-len(candidate_prefix) :]) == _tagless(candidate_prefix)
 
     @staticmethod
     def _strip_inline_persisted_output_generation_identity(

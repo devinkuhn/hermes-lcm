@@ -2,7 +2,6 @@
 
 import json
 import os
-from copy import deepcopy
 
 from hermes_lcm.engine import LCMEngine
 
