@@ -436,7 +436,6 @@ def test_sidecar_restored_content_is_re_escaped(tmp_path):
     from hermes_lcm.reconcile import (
         _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX,
         _escape_replay_identity_content,
-        _count_leading_reserved_prefixes,
     )
     engine = _engine(tmp_path, "sidecar-escape")
     raw = _REPLAY_IDENTITY_ABSENT_CONTENT_PREFIX + " payload tail"
